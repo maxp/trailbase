@@ -3,6 +3,10 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
+**Уточнение 2026-07-28:** runtime — Java 25, Ring adapter — `http-kit`, handlers
+синхронные, async work вынесен в Valkey-backed workers. Полный runtime contract:
+[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#1-runtime-и-границы-сервисов).
+
 ## Контекст
 
 TrailBase backend: HTTP-сервер, bot bridges (Telegram/Max), авторизация (deep-link token verify + session cookie), парсинг GPX, S3-доступ, PostGIS-запросы (динамика search + статика CRUD), server-rendered HTML partials для htmx, миграции. Выбор Clojure — данность (по пользователю). Требуется зафиксировать идиоматический набор библиотек под уже принятые решения.
@@ -11,7 +15,7 @@ TrailBase backend: HTTP-сервер, bot bridges (Telegram/Max), авториз
 
 | Слой | Библиотека | Обоснование |
 |---|---|---|
-| HTTP-сервер | **reitit** + ring (jetty / http-kit adapter) | Compojure устарел; reitit ring-совместимый, data-driven маршруты, integrates с coercion |
+| HTTP-сервер | **reitit** + ring + **http-kit** | Ring-compatible, компактный runtime; blocking/long work вынесен в отдельные workers |
 | DB-доступ | **next.jdbc** | Современная JDBC-обёртка; reducible ResultSet; plain Clojure maps |
 | SQL — динамика | **honeysql** | SQL-as-data; composable для фасетного search (A05), bbox+zoom queries (A02); PostGIS-функции как keys в maps |
 | SQL — статика | **hugsql** | SQL-in-files для CRUD/модерации/миграций; читаемость, подсветка синтаксиса в `.sql` |

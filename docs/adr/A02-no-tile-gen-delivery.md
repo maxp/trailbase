@@ -3,6 +3,10 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
+**Уточнение 2026-07-28:** canonical geometry — 2D MultiLineString в immutable track
+revision; точная zoom-матрица и tolerances зафиксированы в
+[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#17-map-delivery-и-browser-state).
+
 ## Контекст
 
 TrailBase показывает треки на карте. Требуется архитектура доставки геоданных, которая: (а) использует **готовые OpenStreetMap-тайлы** (по прямому требованию пользователя — «не генерируем тайлы»); (б) масштабируется на десятки тысяч треков; (в) не требует генерации MVT/раstup-tile pipeline (Martin, pg_tileserv, tileserver-gl отKeyep на ROI).
@@ -13,9 +17,9 @@ TrailBase показывает треки на карте. Требуется а
 
 1. **Basemap = готовые OSM raster-тайлы** как `raster`-source в MapLibre. Без собственной генерации, без tileserver, без mbtiles pipeline.
 2. **Треки доставляются как adaptive GeoJSON по bbox + zoom:**
-   - **Low-zoom (≤12)**: _треки не рисуются_; рисуются только **POI кластеры**. Сервс-сайд кластеризация в PostGIS (ST_ClusterDBSCAN/hex-binning) возвращает ~500 кластеров.
-   - **Mid-zoom (13–15)**: упрощённые полилинии, `ST_SimplifyPreserveTopology` с zoom-aware tolerance.
-   - **High-zoom (≥16)**: полная детальная геометрия одного/нескольких треков после клика/фокуса.
+   - **Low-zoom (≤12)**: _треки не рисуются_; рисуются только **POI кластеры** из deterministic server-side hex-grid.
+   - **Mid-zoom (13–15)**: z13→z11, z14→z13, z15→z15 precomputed geometry.
+   - **High-zoom (≥16)**: z15 context layer плюс full geometry выбранного трека.
 3. **Pre-computed упрощённые геометрии** в PostGIS: 3 уровня (z11/z13/z15) в колонках `geometry_simplified_z11/13/15` при загрузке трека. On-the-fly `ST_Simplify` только как fallback.
 4. **Запрос:** `/api/tracks?bbox=...&zoom=...` → PostGIS `ST_Intersects(geometry, bbox)` + zoom-aware выбор колонки.
 5. **Raw GPX-файлы + фото — в S3** (см. A07). PostGIS хранит только распарсенную geometry и метаданные.

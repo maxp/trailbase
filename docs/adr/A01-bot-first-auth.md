@@ -3,6 +3,10 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
+**Уточнение 2026-07-28:** tokens и sessions находятся в Valkey; browser login —
+двухшаговый GET/POST flow, provider linking только явный. Полный контракт:
+[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#4-bot-first-authentication).
+
 ## Контекст
 
 TrailBase — публичный каталог GPX-треков. Требуется auth-модель, поддерживающая_web-сайт как first-class приложение и Telegram/Max ботов как основной канал идентификации. По пользователю: «экаунты авторизуются через ботов или по емайлу» — с последующим уточнением: email/телефон оставлены **только как вариант восстановления доступа**, не как login.
@@ -14,7 +18,10 @@ TrailBase — публичный каталог GPX-треков. Требует
    - Юзер `/start` в боте → бот выписывает одноразовый short-lived token;
    - Бот отправляет URL вида `https://catalog/auth?token=...` (deep-link);
    - **Клик → web-backend верифицирует token → создаёт server-side session cookie.**
-3. **Единый аккаунт с провайдерным списком.** Один `user_id`, к нему привязано 0..n OAuth-идентичностей (`telegram:*`, `max:*`) в `user_identities`; 0..n recovery-каналов (email/phone) в `user_recovery`. Первый вход любым login-каналом создаёт скелет аккаунта; привязки добавляются через вопроизвный flow.
+3. **Единый аккаунт с провайдерным списком.** Один `user_id`, к нему привязано 1..n
+   login identities (`telegram:*`, `max:*`) в `user_identities` и 0..n
+   recovery-каналов в `user_recovery`. Первый подтверждённый browser login создаёт
+   аккаунт; последующие identities добавляются только explicit link-flow.
 4. **Боты не дублируют CRUD-UI.** Бот = login bridge + асинхронные уведомления / модерация-инбокс. Все CRUD-операции с треками идут в веб-приложении.
 
 ## Альтернативы рассмотренные

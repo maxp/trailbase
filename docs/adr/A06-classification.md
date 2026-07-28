@@ -3,6 +3,11 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
+**Уточнение 2026-07-28:** tags относятся к immutable track revision; season использует
+четыре bits без отдельного year-round bit; difficulty и duration допускают unknown.
+Полный контракт:
+[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#15-classification-и-tags).
+
 ## Контекст
 
 TrailBase — каталог треков. Требуется модель классификации, которая: (а) поддерживает преgaps-навигацию по каталогу (пеш/вел/лыжи/вода/...); (б) экспонирует «окраску» трека (loop, scenic, overnight, family-friendly...); (в) даёт range-фильтр (продолжительность) и enum/bitmask-фильтр (сезон, трудность); (г) не скатывается в free-form-помойку через год; (д) автовыводит тип активности из GPX-профиля как подсказку. Пользователь добавил четыре фасета: **известные локации** (вынесены в A04 как отдельная сущность), **трудность, продолжительность, сезон**.
@@ -18,8 +23,10 @@ TrailBase — каталог треков. Требуется модель кл�
      - hike: SAC Scale (T1–T6);
      - bike: MTB-Trail-Difficulty (S0–S5 / singletrack grade);
      - другие: 3-level enum `easy/moderate/hard` fallback.
-   - **Season** — bitmask `{spring, summer, autumn, winter, year-round}`.
-   - **Duration** — `duration_hours` numeric; auto-derived из GPX `<time>` timestamps при их наличии, manual при отсутствии; `duration_source ∈ {auto, manual}`.
+   - **Season** — bitmask `{spring, summer, autumn, winter}`; year-round = все четыре,
+     mask 0 = unknown.
+   - **Duration** — seconds numeric; source ∈
+     `{gpx_moving, gpx_elapsed, manual, estimated, unknown}`.
 3. **Auto-suggestion при загрузке** (предсказание рудиментарным классификатором на скорость+размах высот) — подсказка загрузчику; финальный выбор — человеком. Делается на профиле GPX, не server-side тяжёлым ML.
 
 ## Альтернативы рассмотренные

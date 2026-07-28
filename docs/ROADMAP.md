@@ -2,6 +2,10 @@
 
 Декомпозиция дизайна (см. `architecture.md` + `docs/adr/`) на независимо доставляемые вертикальные срезы (tracer bullets). Каждый срез — **runnable end-to-end**, observable через конкретное поведение, а не горизонтальный слой.
 
+Точные security, data-model, runtime и API-инварианты находятся в
+[Implementation Contract](IMPLEMENTATION-CONTRACT.md). Он уточняет этот roadmap и
+имеет приоритет над старыми детальными формулировками ниже.
+
 M01 — prerequisite всех остальных. M02 → M03 → M04 — backbone. M05/M06/M07/M08 — independent extensions поверх backbone (могут разрабатываться параллельно после M04).
 
 ```
@@ -29,20 +33,20 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 - `src/trailbase/db.clj` — next.jdbc datasource + hugsql loader.
 - `src/trailbase/render.clj` — Hiccup → HTML, базовый layout + partials.
 
-**Core-таблицы (M01 заложить миграциями; дополняются в M02/M03/M05)**:
+**Core data model (M01 закладывает основу; M02/M03/M05 дополняют)**:
 - `users`, `user_identities`, `user_recovery`
-- `tracks` (стартовая форма: id, owner_id, name, description, geometry, s3_uri, length_m, ele_gain_m, ele_loss_m, duration_s, duration_source, activity_type, difficulty, season, created_at)
-- `geometry_simplified_z11/13/15` колонки (added в миграции, populated в M03)
-- `tags`, `track_tags` (data tables populated в M07)
-- `locations`, `track_locations` (schema создается в M05)
-- Session storage (ring in-memory или `ring-session` table).
+- `tracks` как stable identity и immutable `track_revisions` для versioned content
+- `tags`, а revision-tag связи добавляются в M07
+- `locations` как stable identity и `location_revisions`, annotations добавляются в M05
+- Valkey для sessions, auth tokens, rate limits и async streams
 
 **Acceptance**:
 - `bb migrate` создаёт PostGIS-расширение и все core-таблицы.
-- `bb run-dev` поднимает HTTP-сервер; `GET /health` → 200 JSON.
+- `bb run-dev` поднимает HTTP-сервер; `/health/live` и внутренний `/health/ready`
+  выполняют разные проверки.
 - `GET /` рендерит Hiccup-страницу с layoutом; partial добавляется через `hx-get`.
 - next.jdbc datasource доступен в REPL; hugsql queries загружаются.
-- Перед этим: `docker-compose.yml` (PostgreSQL+PostGIS, MinIO) поднимается с одной командой.
+- Перед этим Docker Compose поднимает PostgreSQL/PostGIS, MinIO и Valkey одной командой.
 
 **Non-goal**: auth, реальные треки, бот.
 
@@ -50,24 +54,30 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 
 ## M02 — Bot-first Auth
 
-**Объём**: Telegram/Max bot `/start` → deep-link token → web `/auth?token=` → session cookie; единый аккаунт с провайдерами.
+**Объём**: Telegram/Max webhook `/start` → Valkey token → безопасный GET/POST auth
+flow → Valkey session; explicit identity linking, roles и active-session management.
 
 **Файлы/компоненты**:
-- `src/trailbase/bot/telegram.clj` — raw Bot API через hato (getUpdates/setWebhook/sendMessage); polling или webhook-mode.
+- `src/trailbase/bot/telegram.clj` — raw Bot API через hato (setWebhook/sendMessage);
+  polling не реализуется.
 - `src/trailbase/bot/max.clj` — raw Bot API (Max/NetM), аналогично Telegram.
 - `src/trailbase/bot/core.clj` — общая логика: бот = IdP, выдаёт одноразовый short-lived token, дип-link URL.
 - `src/trailbase/auth.clj` — token.issue/verify, session cookie set/get, identity bind/link.
-- Миграции: `002-auth-token.up.sql` (table `auth_tokens(token PK, identity_ref, expires_at, used_at)`).
-- Htmx-endpoint `/auth?token=...` → верифицируется, создаётся user если первый вход, привязка identity, set-cookie, redirect на `/`.
+- Login/link tokens и sessions находятся в Valkey; PostgreSQL хранит users,
+  identities, roles, recovery metadata и audit.
+- `GET /auth` показывает confirmation; `POST /auth` атомарно расходует token, создаёт
+  user при первом входе и выдаёт `__Host-trailbase_session`.
 - Recovery flow placeholder (email/phone) — schema есть, flow в M02 не реализуется (only schema).
 
 **Acceptance**:
 - Telegram bot `/start` → user получает deep-link в чат.
-- Клик по ссылке в браузере → backend верифицирует token → создаётся user (`users` + `user_identities` row) → user залогинен (session cookie виден в DevTools), redirect на `/` с приветствием.
-- Повторный `/start` в Telegram или Max под тем же bot-identity подхватывает тот же `user_id` (если identity уже есть) либо создаёт новый `user_identities` для (= метод link/ing на этом уровне не в MVP).
+- Клик открывает confirmation page; только подтверждённый POST создаёт user и session.
+- Повторный `/start` той же identity использует тот же account. Другой provider
+  привязывается только explicit link-flow из active session.
 - Max bot — тот же flow, тот же `/auth` endpoint, identity `max:*`.
 - Session cookie проверяется middleware; запрос на `/` без cookie редиректит на бота (для MVP поток "no-cookie → prompt bot login" достаточно).
-- Logout-эндпоинт закрывает session.
+- Logout текущей сессии, logout-all и UI active sessions работают; sessions имеют
+  sliding TTL один год.
 
 **Non-goal**: web-форма загрузки треков, восстановление аккаунта через email (schema есть, UI нет).
 
@@ -75,23 +85,30 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 
 ## M03 — GPX Upload + Parse
 
-**Объём**: загрузка raw GPX (из бота и/или веб-формы) → S3 → parse → geometry + auto-derived в PostGIS.
+**Объём**: web/bot upload → encrypted private raw в S3 → async parse job → permanent
+private draft → moderated immutable revision.
 
 **Файлы/компоненты**:
 - `src/trailbase/storage/s3.clj` — aws-simple-sign подпись + hato put/get-object + presigned URL.
-- `src/trailbase/parse/gpx.clj` — `data.xml` pull-парсер → `{:geometry ..., :length_m, :ele_gain_m, :ele_loss_m, :duration_s, :min_ts?, :max_ts?, :points_count}`.
+- `src/trailbase/parse/gpx.clj` — hardened pull-parser → 2D MultiLineString,
+  elevation profile, duration variants, metrics и warnings.
 - `src/trailbase/tracks.clj` — upload flow (write S3 + insert DB), simplify-geometry (compute z11/13/15 в PostGIS-side helper или Clojure-side `simplify`).
-- PostGIS-функция в `003-tracks-geom.up.sql` (migratus) — `populate_simplified_geometries(track_id)` заполняет 3 колонки через `ST_SimplifyPreserveTopology`.
-- Activity-auto-suggestion: рудиментарный classifier на (avg_speed, ele_gain/length ratio) → hедливый ranking activity_type с confidence; предлагается как default в форме.
-- Htmx-форма `/tracks/new`: выбор GPX → submit (multipart) → partial показывает parsed summary (map, length, ele, duration, suggested activity) → user корректирует activity/name/description → final POST `/tracks`.
+- PostGIS-функция в `003-tracks-geom.up.sql` (migratus) —
+  `populate_simplified_geometries(track_revision_id)` заполняет три revision columns.
+- Activity-auto-suggestion: рудиментарный classifier показывает до трёх ranked
+  вариантов с confidence; пользователь обязан выбрать activity явно.
+- Htmx-форма `/tracks/new`: upload создаёт async job; polling открывает private draft
+  preview; пользователь подтверждает metadata и отправляет revision на moderation.
 - Bot-команда `/upload` → бот принимает file_id → backend скачивает с Telegram file proxy → тот же S3+parse+DB flow → deep-link в web-форму для финализации метаданных.
 
 **Acceptance**:
-- Веб-форма загружает GPX 1-10 MB; показывает preview: отрисованная LineString (через <svg> или быстро любую визуализацию), length/ele/duration/suggested activity.
-- Подача финальной формы — row в `tracks` с populated `geometry`, `length_m`, `ele_gain_m`, `ele_loss_m`, `duration_s` (если GPX had `<time>`), `duration_source`, `activity_type` (user-confirmed), `s3_uri`.
-- `geometry_simplified_z11/13/15` колонки populated post insert.
+- Web и bot принимают несжатый GPX 1.0/1.1 до 10 MiB и максимум 250 000 points.
+- Успешный parse создаёт private revision snapshot с 2D MultiLineString, metrics,
+  user-confirmed activity и S3 references.
+- `geometry_simplified_z11/13/15` populated для revision с tolerances 40/10/2 м.
 - Bot `/upload` с GPX-файлом создаёт draft-track с распарсенными auto-derived, user получает deep-link на финализацию в вебе.
-- Re-parse endpoint (admin/dev): `POST /tracks/:id/reparse` перечитывает s3_uri и обновляет PostGIS-geometry (полезно для improved extractor later).
+- Reparse не переписывает опубликованный snapshot; он создаёт новую revision с
+  versioned algorithms.
 
 **Non-goal**: классификация/difficulty/season (M07), POI autodetect (M05), фото (M08).
 
@@ -112,8 +129,10 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 
 **Acceptance**:
 - Карта показывает OSM-raster basemap.
-- При pan/zoom клиент: (а) для z≤13: fetch `/api/locations/clusters.geojson` (~500 кластеров, mark placeholders) — или tracks-as-centroids fallback, если M05 не готов; (б) для z14-15: fetch `/api/tracks.geojson?bbox=&zoom=14/15` → упрощённые LineStrings, WebGL-рендер.
-- High-zoom (≥16): клик по треку → `setData` одной track's full geometry, открывается детальная partial.
+- z0–12 получает server-side POI clusters; z13/z14/z15 используют соответственно
+  z11/z13/z15 simplified geometry.
+- На z16+ z15 остаётся context layer, а full geometry загружается только для
+  выбранного track.
 - Hover трека в sidebar → полилиния на карте стилизована (highlight).
 - Performance: 5000 треков в тестовой выборке — pan/zoom без lag (>30 FPS) в Chrome.
 
@@ -123,23 +142,30 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 
 ## M05 — POI Gazetteer
 
-**Объём**: каталог(locations Point/Line/Polygon) + track_locations link + autodetect + OSM-import + cluster endpoint.
+**Объём**: versioned location catalog, semantic categories, revision annotations,
+autodetect, moderated OSM import и deterministic cluster endpoint.
 
 **Файлы/компоненты**:
-- Миграции `005-poi.up.sql`: `locations` (Geometry(4326, Geometry), type enum `point/line/area`, osm_type, osm_id, name, meta jsonb), `track_locations(track_id, location_id, seq int, distance_along_m, PRIMARY KEY(track_id, location_id))`.
+- Миграции создают `locations`, `location_revisions`, category dictionary,
+  revision-location links и multiple ordered occurrences.
 - `src/trailbase/locations.clj` — CRUD для модератора, list/get, autodetect-along-track (honeysql with `ST_DWithin` / `ST_Intersects` radius-aware), cluster endpoint.
 - ОSM-import pipeline: `src/trailbase/import/osm.clj` — Overpass API fetch by osm_id/type, кэш name/geometry в `locations`, provenance record.
-- Autodetect: after track parse (M03 hook) — backend queries nearby POI with adaptive radius, INSERT into `track_locations` pending_state? — MVP: auto-bind track_locations with `confidence`, помечается как «read-only suggestion» для загрузчика; заявка нового POI — POST `/locations/suggest` → модерация queue (moderation table created в M05 minimum).
-- Low-zoom cluster endpoint (M04 заглушка оживляется): `/api/locations/clusters.geojson?bbox=&zoom=` → ST_ClusterDBSCAN или hex-binning.
-- Bot: загрузчик видит auto-detected POI как inline keyboard ("绑定 к X? да/нет / предложить новый"). Реальные правки — через модерацию.
+- Autodetect создаёт revision-location annotations с confidence/status. High-confidence
+  links к approved locations одобряются автоматически; остальные идут в moderation.
+  Новая POI всегда создаётся через заявку.
+- Low-zoom cluster endpoint использует global hex-grid в EPSG:3857; MapLibre
+  client-side clustering отключён.
+- Bot уведомляет о завершении autodetect и ведёт deep-link в web preview; POI CRUD в
+  боте не дублируется.
 - Мoderator UI: `/moderation/locations` — список заявок, approve → creates location → re-runs autodetect binding.
 
 **Acceptance**:
 - После загрузки трека backend autodetect-ит POI вдоль трека (radius-aware), показывает их в загрузчик-форме.
 - Загрузчик может предложить новое POI через форму (имя, тип, координаты или клик на карте) — заявка в модерацию.
-- Модератор одобряет заявку → POI создаётся → привязка track_locations обновляется.
+- Модератор одобряет заявку → location revision публикуется → annotations
+  пересчитываются.
 - `/api/locations/clusters.geojson?zoom=10` возвращает ≤500 кластер-точек для bbox.
-- Поиск «треки через локацию X» работает: `/locations/:id/tracks` список треков по `track_locations`.
+- Поиск «треки через локацию X» работает по approved revision-location annotations.
 - OSM-import: модератор вводит osm_id+type → backend fetches Overpass → создаёт location с cached name/geometry.
 
 **Non-goal**: модерация тегов (M07), фото POI.
@@ -155,10 +181,12 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
   - GENERATE ALWAYS columns: `ts_description_ru to_tsvector('russian', description->>'ru')`, `ts_description_en to_tsvector('english', description->>'en')`, GIN индексы.
   - `pg_trgm` extension для name fuzzy matching, триграм-индекс на `name`.
   - compound indexes на `(activity_type)`, `(difficulty)`, `(season)`, `(duration_s)` buckets.
-- `src/trailbase/search.clj` — honeysql composable query builder: combine text (tsvector OR/AND `pg_trgm` word_similarity), geo bbox (`ST_Intersects`), фасеты (IN, range), POI-join (`JOIN track_locations`).
-- Endpoint `/api/search?q=&bbox=&activity=&difficulty=&season=&duration_min=&duration_max=&location_id=&page=` → пагинированный результат (list partial) + server-side aggregation partial (activity counts, difficulty distribution).
+- `src/trailbase/search.clj` — honeysql composable query builder: combine text
+  (`tsvector` + `pg_trgm` fallback), geo bbox, facets и approved POI annotations.
+- `/search` отдаёт HTML partial, `/api/v1/search` — JSON; оба используют opaque
+  HMAC-protected keyset cursor и server-side disjunctive facet counts.
 - Instant-search: `hx-get` on `keyup changed delay:300ms` → htmx partial swap `#results` и `#facets`.
-- Location-constraint: `location_id=N` → JOIN `track_locations` → треки через локацию N.
+- Location-constraint: `location_id=N` → join approved revision annotations.
 - Geography-aware: bbox в segmented radio — server postgis geometry comparison.
 
 **Acceptance**:
@@ -181,7 +209,7 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 **Файлы/компоненты**:
 - Миграции `007-tags.up.sql`:
   - `tags(id, key, label_i18n jsonb, parent_id, status enum approved/pending/rejected, created_by, approved_by)`.
-  - `track_tags(track_id, tag_id, source enum user/moderator/derived)` (UNIQUE track_id+tag_id).
+  - `revision_tags(track_revision_id, tag_id, source enum user/moderator/derived)`.
   - `tag_requests(id, requested_tag_label, requested_by, status, declined_reason, created_at, reviewed_by, reviewed_at)`.
 - `src/trailbase/tags.clj` — словарь (list, CRUD модератор), запрос нового тега, одобрение, привязка к треку.
 - `src/trailbase/walks/facets.clj` — обёртка для difficulty (per-activity lookup: SAC для hike, MTB-scale для bike, 3-level fallback), season bitmask, duration handling.
@@ -210,7 +238,8 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 - `src/trailbase/photos.clj` — upload flow (multipart → S3 via aws-simple-sign+hato → insert row), presigned URLs (rotating expiry), delete.
 - Htmx / alpine integration: `/tracks/:id/photos` partial-ul — список + upload-form (`hx-post` with progress indicator).
 - Alpine island for gallery lightbox: `x-data="{open, index}"` + keyboard nav; lazy-swipe for many photos.
-- Elevation profile chart: raw GPX-parse stores `points` query-optimized или pre-computed `elevation_profile` jsonb column at upload (M03 hook). Client → alpine + d3/simple-svg renderer → пан-by-brush ссылается на track detail.
+- Elevation profile chart использует LTTB-profile до 2 000 samples из track revision;
+  полный point array в PostgreSQL не хранится.
 - Map EXIF-plots: photos with `geometry` from EXIF shown as markers on MapLibre (separate source).
 - Presigned URL rotation: photo URLs expire; client refetches через htmx when needed.
 

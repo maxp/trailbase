@@ -3,6 +3,10 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
+**Уточнение 2026-07-28:** POI clustering выполняется только server-side; MapLibre не
+кластеризует уже агрегированные features повторно. Полный frontend/map contract:
+[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#17-map-delivery-и-browser-state).
+
 ## Контекст
 
 Слои фронтенда TrailBase: (а) auth-зона (server-side session cookie — см. A01); (б) поиск по фасетам + instant-search (см. A05); (в) каталог-списки и детали треков; (г) карта с basemap + адаптивными треками и кластерами POI (см. A02); (д) формы загрузки треков; (е) профиль высоты / галерея фото; (ж) модерация-инбокс.
@@ -16,7 +20,7 @@
    - `Alpine.store('map')` — shared state между htmx-зоной и MapLibre instance; `map.on('moveend')` → обновление store → `htmx.ajax` для sidebar + `map.getSource().setData()` для треков.
    - Фильтр-группы (`x-show`), активные вкладки профиля трека, init form с in-flight state, lightbox-галерея, inline-формы модерации.
 3. **MapLibre GL JS** — JS-остров. Персистентный DOM-узел вне htmx-swap-области; WebGL-рендер.
-   - **POI clustering**: встроенный `cluster: true, clusterMaxZoom: 14` поверх GeoJSON source.
+   - **POI clustering**: PostGIS возвращает готовые hex-grid cluster features; GeoJSON source использует `cluster: false`.
    - **Track polylines**: WebGL-рендер адаптивных GeoJSON, data-driven стиль (цвет по activity/difficulty).
 4. **Bridge glue** (~100 строк): события карты → alpine store → htmx/ajax; htmx-события (hover трек в списке) → `map.setFeatureState`. Контейнер карты помечен `hx-disable` (htmx не свапает вглубь).
 

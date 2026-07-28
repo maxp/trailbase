@@ -3,6 +3,10 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
+**Уточнение 2026-07-28:** HTML и JSON имеют явные endpoints, pagination keyset,
+все facet counts считаются server-side с disjunctive semantics. Полный контракт:
+[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#18-search-contract).
+
 ## Контекст
 
 В каталоге TrailBase сосуществуют четыре гомогенно разных типа запросов: текстовый (`"вершина федосеева"`), гео (bbox / `ST_DWithin`), фасетный (`activity=hike AND difficulty=T3 AND season=winter`), реляционный («треки, проходящие через локацию X»). Каждый в Postgres имеет свой механизм (tsvector+GIN, GIST, compound btree, JOIN). Тип multiple backends даёт better search UX (instant fuzzy, ranking). Вопрос: один engine или split.
@@ -14,9 +18,12 @@
    - Текст: `tsvector` колонки, мультиязычная конфигурация (`russian`, `english`, `simple`) над jsonb-описаниями с языковым тегом; GIN-индекс; `pg_trgm` для fuzzy/опечаток.
    - Гео: GIST-индекс на `geometry`; `ST_Intersects`/`ST_DWithin`.
    - Фасеты: btree + compound indexes на `activity_type`, `difficulty`, `season`, `duration_source`.
-   - POI-join: `JOIN track_locations` или `ST_Intersects(track.geometry, locations.geometry)`.
-3. **Склейка в один SQL-запрос** через CTE; отдаёт пагинированный список единого endpoint `/api/search`.
-4. **Instant-search** (`keyup changed delay:300ms`, <200ms budget); **server-side aggregation** по 1-2 primary фасетам (activity, difficulty), остальные client-side.
+   - POI-join: approved revision-location annotations; spatial predicates используются
+     для autodetect, а не подменяют moderated catalog links.
+3. **Склейка в PostgreSQL search service** через CTE; `/search` отдаёт HTML,
+   `/api/v1/search` — JSON с keyset cursor.
+4. **Instant-search** (`keyup changed delay:300ms`, <200ms target); все facet counts
+   вычисляются server-side, исключая собственный facet filter.
 5. **Путь наращивания:** при упоре в текстовый поиск закладывается переход на Meilisearch/Typesense (indexer postgress→Meilisearch через outbox/listen-notify) без слома schema.
 
 ## Альтернативы рассмотренные
