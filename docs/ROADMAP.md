@@ -8,6 +8,12 @@
 
 M01 — prerequisite всех остальных. M02 → M03 → M04 — backbone. M05/M06/M07/M08 — independent extensions поверх backbone (могут разрабатываться параллельно после M04).
 
+Dev и ограниченный pilot с известными участниками допустимы без recovery flow.
+Публичный production launch блокируется до отдельного recovery vertical slice; его
+точный scope фиксируется в Implementation Contract до декомпозиции.
+Для public production настраивается минимум один recovery delivery channel; default —
+email, SMS остаётся optional adapter.
+
 ```
 M01 Foundation
    │
@@ -267,6 +273,8 @@ autodetect, moderated OSM import и deterministic cluster endpoint.
 
 - M01 — prerequisite всех.
 - M02 — после M01 (moderate подмамины — bot, auth).
+- Recovery vertical slice зависит от M02 и является gate публичного production; он не
+  блокирует dev или ограниченный pilot.
 - M03 — после M02 (upload требует login).
 - M04 — после M03 (карта рендерит реальные tracks).
 - M05, M06, M07, M08 — после M04; ** могут разрабатываться параллельно** (independent extensions; не блокируют друг друга кроме небольших hooks):

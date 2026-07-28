@@ -1,7 +1,7 @@
 # TrailBase — Grill-me Checkpoint
 
 Статус: paused
-Дата: 2026-07-28
+Дата: 2026-07-29
 
 Принятые решения сохранены в
 [Implementation Contract](IMPLEMENTATION-CONTRACT.md). Этот файл хранит только точку
@@ -9,17 +9,17 @@
 
 ## Последнее подтверждённое решение
 
-Каждая новая session создаёт обязательное security notification в web inbox и primary
-bot provider. Сообщение содержит время, provider и сокращённое описание устройства,
-но не IP. Sliding TTL refresh существующей session уведомление не создаёт.
-
-При unlink identity notification уходит всем оставшимся providers и best-effort
-отвязываемому provider до удаления связи.
+Terminal recovery request хранится 90 дней, затем физически удаляются request,
+candidate linkage, display snapshots, free-text notes и risk flags. Бессрочный audit
+оставляет request UUID, terminal status/timestamps, actor UUID, reason code и affected
+account UUID — без contact values/HMAC и provider user IDs.
 
 ## Следующий вопрос
 
-Должно ли security notification о новой session содержать deep-link на страницу
-active sessions, где пользователь может немедленно отозвать неизвестную session?
+Нужен ли отдельный appeal workflow для rejected recovery request в первом recovery
+slice?
 
-Рекомендация: да. Ссылка открывает только authenticated session-management UI; сама
-ссылка не выполняет revoke и не содержит action token.
+Рекомендация: нет. После 24-часового cooldown пользователь начинает новый flow и заново
+доказывает оба фактора. Moderator может использовать 90-дневную запись для incident
+review, но не reopen-ит terminal request и не обходит contact/candidate proofs. Appeal
+UI и новый status не входят в первый slice.
