@@ -65,18 +65,26 @@
 
 ### 4.1 Identity и создание аккаунта
 
-- Telegram и Max — единственные login providers. Email и телефон используются только
-  для recovery.
-- Аккаунт создаётся только после успешного browser `POST /auth`; событие `/start` само
-  по себе не создаёт `users`.
-- Identity связывается с аккаунтом только явно из уже авторизованной сессии. Нельзя
-  автоматически объединять аккаунты по имени, username или телефону.
+- Telegram и Max — единственные identity и authentication providers. Email, телефон и
+  отдельные recovery identities отсутствуют.
+- Browser activation не требуется. Валидированная messenger identity достаточна для
+  выполнения разрешённых chat operations и использования account без web session.
+- Первый валидированный `/start` в private one-to-one chat от ранее неизвестной
+  Telegram/Max identity атомарно создаёт active `users` row и первую
+  `user_identities` row. Повторная доставка и конкурентные `/start` идемпотентно
+  resolve в тот же account через unique provider identity; browser session для
+  создания не нужна.
+- Account creation, выпуск web-session/link tokens и identity linking разрешены только
+  в private one-to-one chat с ботом. Group/channel events не создают account, не
+  изменяют identity state и не раскрывают account state; bot отвечает статической
+  ссылкой или инструкцией продолжить в private chat без auth token.
+- Дополнительная identity связывается с account только явно из уже
+  аутентифицированного account context. Нельзя автоматически объединять accounts по
+  имени, username или другим profile fields.
 - Если identity уже принадлежит другому аккаунту, link отклоняется. Account merge
   не входит в M02.
-- В M02 active account всегда сохраняет хотя бы одну active Telegram/Max identity.
-  Recovery contact не считается login method и не позволяет отвязать последнюю bot
-  identity. После реализации recovery flow это ограничение пересматривается отдельным
-  решением.
+- Active account всегда сохраняет хотя бы одну active Telegram/Max identity; отвязать
+  последнюю identity нельзя.
 - При unlink active identity физически удаляется. Audit хранит внутренний identity UUID
   и provider, но не `provider_user_id`.
 - Основное публичное имя — редактируемое `users.display_name`. Оно инициализируется
@@ -86,25 +94,40 @@
 - Provider avatar URL не сохраняется. Допустим только безопасный `provider_avatar_ref`;
   загрузка выполняется сервером.
 - Публично отображаются только TrailBase display name и будущий TrailBase avatar.
-  Provider usernames, identities и recovery contacts не публикуются.
-- Язык при первом входе выбирается в порядке: сохранённая настройка, bot profile,
+  Provider usernames и identities не публикуются.
+- Язык при первом взаимодействии выбирается в порядке: сохранённая настройка, bot profile,
   `Accept-Language`, русский. Ручной выбор больше не перезаписывается автоматически.
 
-### 4.2 Одноразовые tokens и browser flow
+### 4.2 Опциональная browser session и identity linking
 
-- Login и identity-link tokens живут в Valkey 10 минут и расходуются атомарным `GETDEL`.
-- Для каждой provider identity действительна только последняя login-ссылка.
-- `login` и `link_identity` — разные token namespaces/purposes. Link token содержит
-  `target_user_id`; завершение требует active session того же пользователя и CSRF.
-- До выдачи link token требуется fresh bot authentication не старше 10 минут через
-  уже привязанную identity. Подтверждение candidate identity доказывает контроль нового
-  канала, но не заменяет fresh auth существующего владельца; completion требует ту же
-  browser session и session-bound CSRF.
-- `GET /auth?token=...` не расходует token: link preview/scanner не должен сжечь вход.
+- Web-session и identity-link tokens живут в Valkey 10 минут и расходуются атомарным
+  `GETDEL`.
+- Для каждой provider identity действительна только последняя web-session ссылка.
+- `web_session` и `link_identity` — разные token namespaces/purposes. Link token
+  содержит `target_user_id` и ожидаемый candidate provider, но не candidate
+  `provider_user_id`.
+- Link flow инициируется из authenticated account context. До выдачи link token
+  требуется fresh bot authentication не старше 10 минут через уже привязанную
+  identity; browser request дополнительно требует session-bound CSRF.
+- Валидированный provider webhook `/start <link-token>` из private one-to-one chat
+  доказывает контроль candidate identity. Если provider совпадает и identity ещё не
+  связана, backend атомарно расходует token и добавляет `user_identities` к target
+  account. Новый `users` row в linking mode не создаётся, browser session для
+  completion не требуется.
+- Если candidate identity уже принадлежит другому account, link отклоняется;
+  автоматического merge нет.
+- Просроченный, использованный, повреждённый или предназначенный для другого provider
+  link token обрабатывается fail-closed: backend не создаёт `users`, не добавляет
+  identity и не fallback-ит на обычный `/start`. Ответ не раскрывает причину или target
+  account и предлагает получить новую ссылку либо отдельно отправить plain `/start`
+  без payload для создания собственного account.
+- `GET /auth?token=...` для web-session token не расходует token: preview/scanner не
+  должен сжечь вход.
 - GET создаёт короткую auth-flow запись в Valkey и выдаёт `HttpOnly`, `Secure`,
   `SameSite=Lax` flow-cookie плюс одноразовый form nonce.
-- `POST /auth` проверяет cookie/nonce, расходует auth token, создаёт сессию и делает
-  redirect на чистый URL.
+- `POST /auth` проверяет cookie/nonce, расходует token, создаёт только browser session
+  и делает redirect на чистый URL. Он не активирует account и не является обязательным
+  для chat operations.
 - Confirmation page показывает provider и экранированный display name, но не внешний
   provider ID.
 - `return_to` допускает только внутренний путь, начинающийся с одного `/`; absolute URL
@@ -112,7 +135,7 @@
 - Auth pages используют `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, не
   подключают сторонние ресурсы. Значение query parameter `token` удаляется из access и
   application logs.
-- Login/link tokens имеют 128 бит криптографической энтропии: 16 random bytes,
+- Web-session/link tokens имеют 128 бит криптографической энтропии: 16 random bytes,
   Base64URL без padding.
 
 ### 4.3 Sessions в Valkey
@@ -131,22 +154,21 @@
   авторизованном запросе, поэтому отзыв полномочий применяется сразу.
 - Разрешены независимые сессии на нескольких устройствах. M02 включает страницу
   активных сессий, отзыв одной сессии, обычный logout текущей и logout-all.
-- Новый login в уже авторизованном браузере выдаёт новый session ID и отзывает прежнюю
+- Новое browser authentication в уже авторизованном браузере выдаёт новый session ID
+  и отзывает прежнюю
   сессию этого браузера. Сессии других устройств не затрагиваются.
 - Потеря Valkey завершает все сессии. Valkey не восстанавливается из backup, чтобы не
   воскресить отозванные sessions/tokens.
 
 ### 4.4 Sensitive operations и account lifecycle
 
-- Fresh bot authentication не старше 10 минут требуется перед unlink identity,
-  изменением recovery contacts, сменой primary bot provider, logout-all, назначением
-  ролей и деактивацией.
+- Fresh bot authentication не старше 10 минут требуется перед unlink identity, сменой
+  primary bot provider, logout-all, назначением ролей и деактивацией.
 - Просмотр сессий и отзыв одной конкретной сессии доступны по обычной active session.
-- В M02 потеря доступа к единственной bot identity не разрешает ad-hoc admin relink
-  или обход fresh auth. Существующие browser sessions продолжают обычную работу, но
-  linking и sensitive operations недоступны; после утраты sessions account остаётся
-  недоступен до отдельного recovery flow. UI сообщает об отсутствии recovery без
-  раскрытия данных аккаунта.
+- При потере доступа ко всем linked messenger identities self-service recovery
+  отсутствует. Существующие browser sessions продолжают обычную работу, но linking и
+  sensitive operations без fresh bot auth недоступны; после утраты sessions account
+  недоступен.
 - Пользователь может сам деактивировать аккаунт после fresh auth и явного
   подтверждения. Все сессии отзываются, новые входы блокируются, содержимое сохраняется.
 - Реактивация в MVP доступна только администратору, требует fresh auth и audit.
@@ -168,152 +190,16 @@
 - Деактивация отзывает все сессии. Изменение roles не отзывает сессии, поскольку
   permissions читаются из PostgreSQL на каждом запросе.
 
-## 6. Recovery contacts
+## 6. Messenger-only identity boundary
 
-- Публичный production launch блокируется до отдельного recovery vertical slice.
-  После M02 допустимы dev и ограниченный pilot с известными участниками.
-- Для public production требуется минимум один полностью настроенный recovery delivery
-  channel; default — email, SMS optional. UI предлагает только configured channels,
-  phone enrollment недоступен без SMS adapter. Отсутствующая или невалидная
-  конфигурация channel останавливает startup; добавление adapter не меняет recovery
-  domain contract.
-- Runtime outage delivery provider не снимает global readiness: channel получает
-  status `degraded`, OTP send возвращает `503` с `Retry-After`, metrics поднимают alert,
-  а остальные web/auth/catalog routes продолжают работать.
-- Первый email adapter использует authenticated SMTP. Dev поднимает Mailpit, production
-  использует внешний transactional SMTP service; локальный MTA не запускается.
-  Credentials передаются через Docker secrets, TLS обязателен, timeouts ограничены.
-  Vendor-specific HTTP adapter может быть добавлен без изменения domain/outbox
-  contract.
-- Если email channel включён, public production требует отдельный transactional
-  subdomain, SPF/DKIM alignment и DMARC `p=reject`, а release-check — evidence доставки
-  в основные mailbox providers. Runtime не выполняет DNS lookup при каждом OTP send.
-- Recovery email/phone не являются login methods.
-- Account имеет максимум один verified recovery email и один verified recovery phone.
-  Несколько verified contacts одного type в MVP не поддерживаются.
-- Recovery contacts optional: их отсутствие не блокирует login, upload или публикацию.
-  UI заметно предупреждает bot-only account и предлагает enrollment, но пользователь
-  может сохранить такой режим; при потере всех bot identities и sessions recovery
-  невозможно.
-- Последний verified recovery contact можно удалить без замены только после fresh bot
-  auth, session-bound CSRF и отдельного подтверждения необратимого риска. Contact
-  физически удаляется и сразу перестаёт участвовать в recovery. Security event
-  сохраняется в web inbox, отправляется всем active bot identities и best-effort
-  удаляемому contact через encrypted snapshot с лимитом пять попыток/15 минут.
-- При замене email/phone старый contact остаётся verified и пригодным для recovery до
-  успешного OTP нового. Для каждого type разрешён максимум один pending replacement;
-  новый contact не участвует в recovery или security fan-out до verification.
-  Успешный OTP атомарно делает новый contact verified и завершает старый.
-- Успешная замена recovery contact создаёт одну web inbox запись и best-effort
-  уведомляется через все active bot identities, старый и новый contacts. Сообщение
-  содержит время, contact type и только masked old/new values; raw values и IP
-  отсутствуют. Delivery failure не откатывает замену.
-- После успешной замены старые ciphertext и HMAC contact физически удаляются.
-  Transaction сохраняет только зашифрованный outbox delivery-target snapshot для
-  старого contact: максимум пять попыток и 15 минут, затем snapshot очищается и не
-  replay-ится. Audit хранит internal contact UUID и type, но не значение или HMAC.
-- Recovery начинается с `/recover` в candidate Telegram/Max bot. Bot создаёт
-  short-lived recovery-start token, привязанный к candidate identity, и ведёт в
-  web-flow. Форма принимает recovery contact и отвечает одинаково независимо от
-  существования совпадения; OTP отправляется только для verified contact. До успешного
-  подтверждения contact данные account не показываются.
-- Recovery-start token имеет 128 бит CSPRNG и TTL 10 минут; для candidate identity
-  действителен только последний token. GET показывает `no-store` preview и не
-  расходует token. Подтверждённый POST атомарно выполняет `GETDEL`, создаёт
-  candidate-bound preliminary state в Valkey и исключает повторное использование
-  token.
-- Recovery email и phone подтверждаются единым шестизначным numeric OTP. TTL — 10
-  минут, максимум пять verification attempts, resend — не раньше 60 секунд; новый OTP
-  инвалидирует предыдущий. Сервер хранит только keyed HMAC кода с отдельным versioned
-  secret и использует constant-time comparison; plaintext отсутствует в PostgreSQL,
-  логах и audit.
-- Recovery OTP message содержит только TrailBase branding, шестизначный code, TTL 10
-  минут, время запроса и инструкцию игнорировать незапрошенное сообщение. В нём нет
-  magic/action links, account name, contact echo, provider user ID, IP или device
-  details. Email имеет `text/plain` и минимальный HTML без external resources/tracking;
-  SMS помещается в одно сообщение.
-- Unverified contact не сохраняется в PostgreSQL. Encrypted preliminary contact и OTP
-  state живут только в Valkey 10 минут; успешный OTP атомарно вставляет или заменяет
-  verified row. Concurrent claim разрешает PostgreSQL unique constraint, проигравший
-  flow получает нейтральную ошибку.
-- OTP issuance одновременно ограничен: 3/час и 5/сутки на HMAC recovery contact,
-  3/час и 10/сутки на candidate identity, 10/час и 30/сутки на краткоживущий IP key.
-  Действует первый достигнутый предел; ответ одинаковый `429` с `Retry-After`. Raw
-  contact и IP не сохраняются в PostgreSQL или логах.
-- До успешного OTP preliminary state живёт только в Valkey с TTL и имеет одинаковую
-  форму для существующего и отсутствующего contact match. Успешная проверка атомарно
-  расходует OTP и только тогда создаёт durable PostgreSQL moderation request.
-- Durable recovery request действует 24 часа от успешного OTP. После deadline он
-  атомарно переходит в `expired`, не может быть approved и требует повторения обоих
-  доказательств.
-- Approve недоступен первый час после `created_at`: conditional update требует
-  `now >= approvable_at`. Moderator reject и owner cancel доступны сразу; 24-часовой
-  expiry не меняется.
-- Создание pending request создаёт `recovery_requested` в web inbox и best-effort
-  уведомляет все active bot identities и verified recovery contacts. Deep-link ведёт
-  в authenticated security UI без action token. Existing owner может отменить request
-  после fresh auth через linked bot identity и с CSRF; conditional update переводит
-  только `pending` request в `cancelled`, после чего approve невозможен.
-- Approve требует транзакционно сохранённые web inbox и outbox events, но не
-  подтверждённую внешнюю delivery. Полный failure fan-out поднимает high-severity
-  moderator alert; bot/email/SMS outage не блокирует legitimate recovery после
-  cooling-off.
-- После owner cancel действует 24-часовой cooldown для target account и HMAC recovery
-  contact независимо от candidate identity. Candidate видит нейтральный terminal
-  status. `recovery_cancelled` сохраняется в web inbox и best-effort отправляется всем
-  active bot identities и verified recovery contacts без данных о session или identity,
-  выполнившей cancel.
-- Для account допускается только одна pending recovery request. Повтор с той же
-  candidate identity идемпотентно возвращает существующую request; другая candidate
-  identity не заменяет её, получает нейтральный ответ и создаёт
-  `recovery_attempt_conflict` security event. Новая request разрешена только после
-  approve, reject, cancel или expire предыдущей.
-- `recovery_attempt_conflict` создаёт одну web inbox запись и best-effort уведомляется
-  через все active bot identities и все verified recovery contacts, а не только
-  primary. Candidate получает нейтральный status. Сообщение содержит время и candidate
-  provider type, но не contact value, provider user ID или данные pending request.
-- Moderator recovery UI показывает internal account/request UUID, masked recovery
-  contact и type, `verified_at`, provider types и возраст linked identities, candidate
-  provider type и безопасный display snapshot, timestamps и агрегированные risk flags.
-  Raw contact, provider user IDs, OTP/HMAC, IP и auth/session tokens не показываются.
-- В MVP approve/reject выполняет один moderator с permission
-  `account_recovery:decide`, fresh bot authentication не старше 10 минут,
-  session-bound CSRF и обязательной reason. Moderator не может решать recovery своего
-  account. Conditional update применяется только к `pending` и неистёкшей request;
-  решение полностью сохраняется в audit.
-- При reject candidate видит только нейтральный status `rejected`; moderator reason и
-  risk flags остаются в audit и moderator UI. Trusted channels получают security
-  notification со временем и candidate provider type, но без внутренней reason.
-- Terminal recovery request хранится 90 дней для incident review, затем физически
-  удаляются request, candidate linkage, display snapshots, free-text notes и risk
-  flags. Бессрочный append-only audit сохраняет только request UUID, terminal
-  status/timestamps, actor UUID, reason code и affected account UUID; contact
-  values/HMAC и provider user IDs в него не попадают.
-- После reject действует 24-часовой cooldown для target account и HMAC recovery
-  contact; смена candidate identity его не обходит. До deadline flow отвечает
-  нейтрально и не отправляет OTP. Candidate, уже доказавший contact в rejected request,
-  видит время следующей допустимой попытки.
-- Recovery требует два независимых доказательства: одноразовое подтверждение ранее
-  verified recovery email/phone и контроль candidate Telegram/Max identity. Moderator
-  проверяет заявку и collision/abuse signals, но не может заменить ни один фактор.
-  Если потеряны оба канала, recovery в MVP невозможно.
-- Approved recovery выполняется атомарно: candidate identity привязывается и становится
-  primary, все прежние bot identities получают status `disabled`, все Valkey sessions
-  отзываются. Старые identities автоматически не удаляются и не могут выполнить login;
-  после нового входа пользователь отдельно подтверждает их re-link либо оставляет
-  disabled.
-- Approved recovery создаёт одно `account_recovered` security notification в web inbox
-  и best-effort доставляет его новой primary identity, всем прежним bot identities и
-  всем verified recovery contacts. Сообщение содержит время и изменённые provider
-  types, но не contact values, provider user IDs или IP; delivery failure не откатывает
-  recovery.
-- Значение хранится как AES-256-GCM ciphertext со случайным 96-bit nonce.
-- Для uniqueness/search хранится HMAC-SHA-256 нормализованного значения.
-- Encryption и HMAC используют разные versioned keys из Docker secrets; запись содержит
-  format/key version.
-- Email normalization: trim, Unicode NFC, lowercase. Phone normalization: строгий E.164.
-- PostgreSQL хранит только verified recovery contacts. Их HMAC уникален между
-  аккаунтами; unverified/pending rows отсутствуют.
+- Telegram и Max — полный и закрытый список identity providers.
+- Email, phone, passwords, recovery contacts, OTP и отдельный account-recovery flow
+  отсутствуют в schema, configuration, UI и roadmap.
+- Доступ через chat не зависит от наличия browser session. Web остаётся first-class
+  интерфейсом, но его активация не является условием существования или использования
+  account.
+- Потеря доступа ко всем linked messenger identities означает потерю self-service
+  доступа к account; новый recovery mechanism требует отдельного будущего решения.
 
 ## 7. HTTP security
 
@@ -358,8 +244,9 @@
 - Transient failure: пять попыток с exponential backoff, затем dead-letter stream.
   Replay DLQ выполняется отдельной admin/CLI operation.
 - Успешно обработанные raw webhook payloads сохраняются 24 часа; DLQ — 30 дней.
-- Auth token выдаётся только в private chat. В группе бот даёт ссылку открыть private
-  chat без token.
+- Identity commands и web-session/link tokens обрабатываются только в private chat.
+  В группе или канале bot предлагает открыть private chat без token и без раскрытия
+  account state.
 
 ### 8.1 Исходящие уведомления и web inbox
 
@@ -385,7 +272,7 @@
   или `archived_at`, но не удалить запись до окончания retention.
 - Moderation/catalog/informational categories настраиваются пользователем.
   Security notifications обязательны и всегда попадают в web inbox и primary bot.
-- Security events: новая session, identity link/unlink, recovery/role/account changes.
+- Security events: новая browser session, identity link/unlink, role и account changes.
 - Смена primary bot provider всегда создаёт запись в web inbox и best-effort
   уведомляется через прежний и новый primary providers. Ошибка любой bot delivery не
   откатывает подтверждённую смену.
@@ -422,8 +309,13 @@
 
 ## 10. GPX intake и validation
 
-- Web и bot uploads используют один pipeline. Bot `/upload` доступен только identity,
-  уже связанной с active TrailBase account.
+- Web и bot uploads используют один pipeline. Bot `/upload` доступен только в private
+  one-to-one chat для identity, прошедшей provider webhook validation; browser session
+  для upload не требуется. Group/channel upload не создаёт job или draft и предлагает
+  продолжить в private chat.
+- Полный upload flow может завершаться в Telegram/Max chat: приём файла, validation,
+  выбор обязательных metadata, preview статуса parse и отправка revision на moderation.
+  Web deep-link остаётся дополнительным, а не обязательным шагом.
 - Лимит raw GPX — 10 MiB; лимит всего multipart request — 12 MiB. Provider-reported
   size/`Content-Length` проверяется, но download дополнительно имеет streaming hard cap.
 - Принимается только несжатый GPX/XML 1.0 или 1.1. `.gz` и ZIP в MVP запрещены.
@@ -481,8 +373,10 @@
 - S3 и PostgreSQL согласуются через `upload_jobs`: pending DB row, object write,
   validation/parse, transactional revision creation, terminal status.
 - Incomplete jobs и orphan objects старше 24 часов удаляет janitor.
-- HTTP upload только принимает/шифрует object и ставит parse job. UI опрашивает status
-  htmx-запросом каждые две секунды до terminal state.
+- HTTP upload только принимает/шифрует object и ставит parse job. Web UI опрашивает
+  status htmx-запросом каждые две секунды до terminal state. Для bot upload terminal
+  status публикуется обратно в исходный chat, после чего bot продолжает metadata и
+  moderation flow.
 - Transient S3/Valkey/PostgreSQL failures повторяются до трёх раз. Invalid GPX,
   отсутствующая geometry и превышение limits завершаются без retry.
 - После успешного parse создаётся постоянный private track draft. Он не истекает и
@@ -668,6 +562,53 @@
   joins по approved revision annotations.
 - `/search` возвращает Hiccup/HTML для htmx; `/api/v1/search` — стабильный JSON. Оба
   используют одну domain search service.
+- Telegram/Max `/search` использует ту же domain search service и выполняется без
+  browser session. Bot адаптирует filters и pagination к chat controls; search semantics
+  и permission checks не расходятся с web/API.
+- В private chat search выполняется с permissions связанного account. В group/channel
+  chat `/search` разрешён только как account-stateless read-only поиск по public
+  published catalog: он не создаёт account, не возвращает private/unlisted tracks или
+  персональные данные и не сохраняет user history/settings.
+- Filter/pagination controls у group-search результата принимает только requester,
+  инициировавший конкретный `/search`. Callback cryptographically связывается с
+  provider, chat, message, requester identity и search cursor/query state. Нажатие
+  другим участником не меняет общий результат и предлагает запустить собственный
+  `/search`.
+- Если channel context не предоставляет стабильную requester identity, `/search`
+  публикует только статическую первую страницу public results без filter/pagination
+  controls. Для продолжения bot добавляет обычную ссылку в private chat без auth token
+  и account state.
+- Interactive search controls в private/group chats имеют абсолютный TTL 15 минут от
+  создания результата без sliding refresh. После expiry callback не изменяет старое
+  сообщение и предлагает повторить `/search`.
+- Chat-search callback содержит только случайный 128-bit opaque ID. Valkey record хранит
+  provider/chat/message/requester binding, query, filters, cursor и исходный absolute
+  expiry; query и identity не попадают в provider callback payload. Потеря Valkey или
+  записи инвалидирует controls без восстановления и предлагает повторить `/search`.
+- Успешный filter/page callback атомарно проверяет binding/expiry, расходует текущий
+  Valkey record и создаёт новый opaque ID с обновлённым search state, сохраняя исходный
+  absolute `expires_at`. Только callback, выигравший ротацию, может редактировать
+  result message; повторный или конкурентный callback со старым ID считается stale и
+  message не меняет.
+- Если rotation завершилась, а provider edit вернул transient error или ambiguous
+  outcome, retry использует тот же новый ID и state. После исчерпания bounded retry
+  новый Valkey record удаляется, старый не восстанавливается, а result message
+  считается неинтерактивным и предлагает повторить `/search`.
+- Search-result edit делает максимум пять total attempts с exponential backoff и
+  jitter. Retry разрешён только для timeout/network errors, `429` и `5xx`; `Retry-After`
+  соблюдается, только если следующая попытка укладывается в исходный `expires_at`.
+  Остальные `4xx` terminal сразу. После terminal failure ephemeral edit не попадает в
+  DLQ или поздний replay.
+- Provider-specific callback acknowledgement отправляется сразу после проверки
+  requester binding/expiry и успешной atomic rotation, до search query и result edit.
+  Он подтверждает только приём нажатия; дальнейшую работу выполняет `bot-worker`.
+  Webhook ingress `2xx` остаётся отдельным подтверждением доставки event.
+- Stale, foreign или expired callback не ротирует state и не меняет result message;
+  provider acknowledgement содержит короткое нейтральное объяснение.
+- Если после ACK/rotation search query завершается timeout или transient error, новый
+  callback state удаляется, а старый ID не восстанавливается. Bot сохраняет прежний
+  result content, но terminal edit убирает controls и добавляет нейтральную инструкцию
+  повторить `/search`; edit использует тот же provider retry policy.
 - Instant search запускается с трёх символов. Явный submit длиной 1–2 символа выполняет
   только exact/prefix search без trigram.
 - Exact/prefix tsvector results ранжируются выше fuzzy. `pg_trgm` — fallback, если

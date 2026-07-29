@@ -9,17 +9,17 @@
 
 ## Последнее подтверждённое решение
 
-Terminal recovery request хранится 90 дней, затем физически удаляются request,
-candidate linkage, display snapshots, free-text notes и risk flags. Бессрочный audit
-оставляет request UUID, terminal status/timestamps, actor UUID, reason code и affected
-account UUID — без contact values/HMAC и provider user IDs.
+Если после ACK/rotation search query завершается timeout/transient error, новый
+callback state удаляется, а старый ID не восстанавливается. Прежний result content
+остаётся видимым, но terminal edit убирает controls и предлагает повторить `/search`,
+используя принятый provider retry policy.
 
 ## Следующий вопрос
 
-Нужен ли отдельный appeal workflow для rejected recovery request в первом recovery
-slice?
+Разрешать ли одному пользователю несколько одновременно незавершённых upload flows в
+private chat?
 
-Рекомендация: нет. После 24-часового cooldown пользователь начинает новый flow и заново
-доказывает оба фактора. Moderator может использовать 90-дневную запись для incident
-review, но не reopen-ит terminal request и не обходит contact/candidate proofs. Appeal
-UI и новый status не входят в первый slice.
+Рекомендация: да, до уже принятого лимита трёх active upload/parse jobs, но без
+неявного «текущего upload». Каждый status/control/metadata prompt связывается с
+конкретным `upload_job_id`; свободный текст принимается только как reply на prompt
+этого job, иначе bot просит выбрать upload.

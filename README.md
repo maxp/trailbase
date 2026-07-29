@@ -15,8 +15,8 @@ TrailBase — открытый каталог GPX-треков с картой, 
 - интерактивная карта с адаптивной доставкой геоданных;
 - полнотекстовый, географический и фасетный поиск;
 - каталог POI с OSM provenance;
-- bot-first аутентификация через Telegram и Max;
-- уведомления и управление основными сценариями через веб-интерфейс.
+- messenger identity через Telegram и Max без обязательной web activation;
+- upload, search и уведомления через chats, с опциональным полноценным web-интерфейсом.
 
 ## Архитектура
 
@@ -29,7 +29,7 @@ Compose и используют PostgreSQL/PostGIS, Valkey и S3-совмест�
 
 ```text
 M01 Foundation
-  → M02 Auth
+  → M02 Messenger Identity
   → M03 GPX Upload
   → M04 Catalog Render
   → M05–M08 POI, Search, Classification, Photo/Elevation

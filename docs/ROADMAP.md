@@ -8,17 +8,11 @@
 
 M01 — prerequisite всех остальных. M02 → M03 → M04 — backbone. M05/M06/M07/M08 — independent extensions поверх backbone (могут разрабатываться параллельно после M04).
 
-Dev и ограниченный pilot с известными участниками допустимы без recovery flow.
-Публичный production launch блокируется до отдельного recovery vertical slice; его
-точный scope фиксируется в Implementation Contract до декомпозиции.
-Для public production настраивается минимум один recovery delivery channel; default —
-email, SMS остаётся optional adapter.
-
 ```
 M01 Foundation
    │
    ▼
-M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
+M02 Identity ──▶ M03 Upload ──▶ M04 Catalog Render
                               │
                 ┌─────────────┼─────────────┐
                 ▼             ▼             ▼             ▼
@@ -40,11 +34,12 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 - `src/trailbase/render.clj` — Hiccup → HTML, базовый layout + partials.
 
 **Core data model (M01 закладывает основу; M02/M03/M05 дополняют)**:
-- `users`, `user_identities`, `user_recovery`
+- `users`, `user_identities`
 - `tracks` как stable identity и immutable `track_revisions` для versioned content
 - `tags`, а revision-tag связи добавляются в M07
 - `locations` как stable identity и `location_revisions`, annotations добавляются в M05
-- Valkey для sessions, auth tokens, rate limits и async streams
+- Valkey для browser sessions, web-session/link tokens, ephemeral chat interaction
+  state, rate limits и async streams
 
 **Acceptance**:
 - `bb migrate` создаёт PostGIS-расширение и все core-таблицы.
@@ -58,34 +53,51 @@ M02 Auth ──▶ M03 Upload ──▶ M04 Catalog Render
 
 ---
 
-## M02 — Bot-first Auth
+## M02 — Messenger Identity + Optional Web Session
 
-**Объём**: Telegram/Max webhook `/start` → Valkey token → безопасный GET/POST auth
-flow → Valkey session; explicit identity linking, roles и active-session management.
+**Объём**: Telegram/Max webhook identity → account и chat operations без обязательного
+web activation; optional deep-link → безопасный GET/POST flow → Valkey browser session;
+explicit identity linking, roles и active-session management.
 
 **Файлы/компоненты**:
 - `src/trailbase/bot/telegram.clj` — raw Bot API через hato (setWebhook/sendMessage);
   polling не реализуется.
 - `src/trailbase/bot/max.clj` — raw Bot API (Max/NetM), аналогично Telegram.
-- `src/trailbase/bot/core.clj` — общая логика: бот = IdP, выдаёт одноразовый short-lived token, дип-link URL.
+- `src/trailbase/bot/core.clj` — общая проверка messenger identity, command routing и
+  обработка обычного `/start`, `/start <link-token>` и optional browser-session
+  deep-link.
 - `src/trailbase/auth.clj` — token.issue/verify, session cookie set/get, identity bind/link.
-- Login/link tokens и sessions находятся в Valkey; PostgreSQL хранит users,
-  identities, roles, recovery metadata и audit.
-- `GET /auth` показывает confirmation; `POST /auth` атомарно расходует token, создаёт
-  user при первом входе и выдаёт `__Host-trailbase_session`.
-- Recovery flow placeholder (email/phone) — schema есть, flow в M02 не реализуется (only schema).
+- Web-session/link tokens и sessions находятся в Valkey; PostgreSQL хранит users,
+  messenger identities, roles и audit.
+- `GET /auth` показывает confirmation; `POST /auth` атомарно расходует token и выдаёт
+  `__Host-trailbase_session`, но не активирует account.
 
 **Acceptance**:
-- Telegram bot `/start` → user получает deep-link в чат.
-- Клик открывает confirmation page; только подтверждённый POST создаёт user и session.
-- Повторный `/start` той же identity использует тот же account. Другой provider
-  привязывается только explicit link-flow из active session.
-- Max bot — тот же flow, тот же `/auth` endpoint, identity `max:*`.
-- Session cookie проверяется middleware; запрос на `/` без cookie редиректит на бота (для MVP поток "no-cookie → prompt bot login" достаточно).
+- Первый валидированный Telegram `/start` в private one-to-one chat для неизвестной
+  identity атомарно создаёт active account и identity; повторные или конкурентные
+  deliveries идемпотентно resolve в тот же account.
+- Созданная Telegram identity может выполнять разрешённые chat commands без web
+  session.
+- Telegram bot `/start` может предложить optional browser deep-link; confirmation POST
+  создаёт browser session, но не является условием account/chat access.
+- `/start <link-token>` от второго provider атомарно привязывает candidate identity к
+  target account и не создаёт отдельный account; browser completion не требуется.
+- Identity, уже принадлежащая другому account, не переносится; автоматического merge
+  accounts нет.
+- Невалидный, просроченный, использованный или provider-mismatched link token не
+  создаёт account и не fallback-ит на обычный `/start`; plain `/start` без payload
+  остаётся отдельным явным созданием account.
+- В group/channel contexts `/start`, выпуск tokens и linking не создают и не изменяют
+  account/identity state; bot без auth token направляет пользователя в private chat.
+- Max bot поддерживает тот же identity/chat contract и optional `/auth` endpoint,
+  identity `max:*`.
+- Session cookie проверяется middleware; запрос на web UI без cookie предлагает вход
+  через Telegram/Max.
 - Logout текущей сессии, logout-all и UI active sessions работают; sessions имеют
   sliding TTL один год.
+- Email, phone, password и recovery flow отсутствуют.
 
-**Non-goal**: web-форма загрузки треков, восстановление аккаунта через email (schema есть, UI нет).
+**Non-goal**: фактическая загрузка и поиск треков — M03 и M06.
 
 ---
 
@@ -105,14 +117,19 @@ private draft → moderated immutable revision.
   вариантов с confidence; пользователь обязан выбрать activity явно.
 - Htmx-форма `/tracks/new`: upload создаёт async job; polling открывает private draft
   preview; пользователь подтверждает metadata и отправляет revision на moderation.
-- Bot-команда `/upload` → бот принимает file_id → backend скачивает с Telegram file proxy → тот же S3+parse+DB flow → deep-link в web-форму для финализации метаданных.
+- Bot-команда `/upload` → бот принимает file_id → backend скачивает файл через provider
+  API → тот же S3+parse+DB flow → обязательные metadata и отправка на moderation
+  завершаются в private one-to-one chat; web deep-link optional. Group/channel upload
+  не создаёт job или draft.
 
 **Acceptance**:
 - Web и bot принимают несжатый GPX 1.0/1.1 до 10 MiB и максимум 250 000 points.
 - Успешный parse создаёт private revision snapshot с 2D MultiLineString, metrics,
   user-confirmed activity и S3 references.
 - `geometry_simplified_z11/13/15` populated для revision с tolerances 40/10/2 м.
-- Bot `/upload` с GPX-файлом создаёт draft-track с распарсенными auto-derived, user получает deep-link на финализацию в вебе.
+- Bot `/upload` с GPX-файлом создаёт draft-track с распарсенными auto-derived; user
+  подтверждает обязательные metadata и отправляет revision на moderation без web
+  session.
 - Reparse не переписывает опубликованный snapshot; он создаёт новую revision с
   versioned algorithms.
 
@@ -191,6 +208,28 @@ autodetect, moderated OSM import и deterministic cluster endpoint.
   (`tsvector` + `pg_trgm` fallback), geo bbox, facets и approved POI annotations.
 - `/search` отдаёт HTML partial, `/api/v1/search` — JSON; оба используют opaque
   HMAC-protected keyset cursor и server-side disjunctive facet counts.
+- Telegram/Max `/search` использует тот же domain search service, filters и keyset
+  pagination, адаптированные к chat controls; browser session не требуется.
+- Group/channel `/search` использует public principal: только published public tracks,
+  без account creation, персональных данных и сохранения history/settings.
+- Group-search controls связаны с provider/chat/message/requester; только инициатор
+  запроса может менять filters или page общего результата.
+- Channel search без стабильной requester identity возвращает статическую первую
+  страницу без controls и предлагает продолжить в private chat.
+- Search controls в private/group chats истекают через 15 минут от создания без
+  продления; expired callback не редактирует старое сообщение.
+- Chat-search callback содержит только случайный 128-bit opaque ID; binding,
+  query/filters/cursor и absolute expiry хранятся в Valkey.
+- Каждый успешный control callback атомарно заменяет текущий opaque ID новым с тем же
+  исходным `expires_at`; только победитель ротации редактирует message.
+- Transient/ambiguous provider edit повторяется с тем же новым ID; terminal failure
+  удаляет новый state без rollback старого.
+- Search-result edit имеет максимум пять total attempts с backoff/jitter; retry только
+  для network/timeout, `429` и `5xx`, не позже исходного `expires_at`.
+- Callback acknowledgement отправляется после binding/expiry validation и atomic
+  rotation, до query/edit; `bot-worker` обновляет result асинхронно.
+- Query timeout/transient failure после ACK удаляет новый state без rollback,
+  сохраняет прежний result content и terminal edit убирает controls.
 - Instant-search: `hx-get` on `keyup changed delay:300ms` → htmx partial swap `#results` и `#facets`.
 - Location-constraint: `location_id=N` → join approved revision annotations.
 - Geography-aware: bbox в segmented radio — server postgis geometry comparison.
@@ -203,6 +242,27 @@ autodetect, moderated OSM import и deterministic cluster endpoint.
 - Instant-search: ввод 3+ символов → partial swap без перезагрузки страницы; сервер откликивается <200ms на индексированных данных.
 - `#facets` обновляется server-side aggregation (activity counts, difficulty distribution) при каждом изменении фильтра.
 - Мультиязычность: `description` jsonb с языковыми ветвями; tsvector собирается из всех языков, ranking по combined.
+- Bot `/search` возвращает те же результаты и permission-filtered facets, что web/API,
+  с постраничной навигацией в chat.
+- Group/channel search никогда не возвращает private/unlisted tracks; bot upload и
+  state-changing commands остаются private-chat-only.
+- Нажатие group-search control другим участником не меняет результат и предлагает ему
+  запустить отдельный `/search`.
+- Channel search без requester identity не создаёт callback state; ссылка для
+  продолжения в private chat не содержит auth token.
+- Через 15 минут search control предлагает повторить `/search` и не меняет старый
+  result message.
+- Потеря Valkey callback state безопасно инвалидирует controls; query и requester
+  identity отсутствуют в provider callback payload.
+- Повторный или конкурентный callback со старым ID считается stale и не может
+  перезаписать новый search result.
+- После исчерпания provider-edit retries result становится неинтерактивным и предлагает
+  повторить `/search`.
+- Permanent `4xx` не retry-ится; исчерпанный ephemeral edit не попадает в DLQ/replay.
+- Stale/foreign/expired callback получает нейтральный acknowledgement, не ротирует
+  state и не изменяет общее сообщение.
+- При query failure старый result остаётся видимым без controls и предлагает повторить
+  `/search`; terminal edit использует общий provider retry policy.
 
 **Non-goal**: external search engine (Meilisearch), semantic search (pgvector).
 
@@ -265,7 +325,8 @@ autodetect, moderated OSM import и deterministic cluster endpoint.
 - **telemere** логирование: с M01; structured logs в каждом handler.
 - **Malli schemas** для API валидации: с M01 (health schema) и расширяется каждый срез.
 - **reitit coercion** полной цепочки middleware: с M01.
-- **bot module** (raw Bot API over hato): телеграм в M02, Max в M02+; Max API может отстоязить CFL позже, но конец M02 — работающий login через оба.
+- **bot module** (raw Bot API over hato): Telegram и Max входят в M02; конец M02 —
+  работающие identity и разрешённые chat operations через оба provider.
 - **tests**: по одному integration test на каждый срез (smoke-level: upload fixture GPX, render map page, search returns expected track). Не TDD по слоям, smoke на end-to-end.
 - **I18n**: partial-render с языковым выбором; minimum: ru, en, simple (tags/POI names).
 
@@ -273,9 +334,7 @@ autodetect, moderated OSM import и deterministic cluster endpoint.
 
 - M01 — prerequisite всех.
 - M02 — после M01 (moderate подмамины — bot, auth).
-- Recovery vertical slice зависит от M02 и является gate публичного production; он не
-  блокирует dev или ограниченный pilot.
-- M03 — после M02 (upload требует login).
+- M03 — после M02 (ownership требует messenger identity/account).
 - M04 — после M03 (карта рендерит реальные tracks).
 - M05, M06, M07, M08 — после M04; ** могут разрабатываться параллельно** (independent extensions; не блокируют друг друга кроме небольших hooks):
   - M06 search facet-aggregation нормально работает до M07 (tags NULL = no facets), а после M07 facets оживает.

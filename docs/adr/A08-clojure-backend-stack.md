@@ -7,9 +7,17 @@
 синхронные, async work вынесен в Valkey-backed workers. Полный runtime contract:
 [Implementation Contract](../IMPLEMENTATION-CONTRACT.md#1-runtime-и-границы-сервисов).
 
+**Уточнение 2026-07-29:** Telegram/Max chats вызывают общие upload/search domain
+services напрямую; deep-link token нужен только для optional browser session.
+Короткоживущий chat-search callback state хранится в Valkey за случайным opaque ID.
+
 ## Контекст
 
-TrailBase backend: HTTP-сервер, bot bridges (Telegram/Max), авторизация (deep-link token verify + session cookie), парсинг GPX, S3-доступ, PostGIS-запросы (динамика search + статика CRUD), server-rendered HTML partials для htmx, миграции. Выбор Clojure — данность (по пользователю). Требуется зафиксировать идиоматический набор библиотек под уже принятые решения.
+TrailBase backend: HTTP-сервер, Telegram/Max chat adapters, messenger identity и
+optional browser-session flow, парсинг GPX, S3-доступ, PostGIS-запросы (динамика
+search + статика CRUD), server-rendered HTML partials для htmx, миграции. Chat и web
+вызывают общие domain services. Выбор Clojure — данность (по пользователю). Требуется
+зафиксировать идиоматический набор библиотек под уже принятые решения.
 
 ## Решение
 
