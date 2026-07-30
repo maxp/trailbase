@@ -3,10 +3,15 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
-**Уточнение 2026-07-28:** tags относятся к immutable track revision; season использует
+**Уточнение 2026-07-29:** tags относятся к immutable track revision; season использует
 четыре bits без отдельного year-round bit; difficulty и duration допускают unknown.
-Полный контракт:
+Canonical duration выбирается moving → elapsed → unknown; manual override ограничен
+целыми секундами `1..31_536_000`, а unknown хранится как `NULL`. Полный контракт:
 [Implementation Contract](../IMPLEMENTATION-CONTRACT.md#15-classification-и-tags).
+
+**Уточнение 2026-07-30:** activity, difficulty и tags остаются в TrailBase
+track page/JSON API и не сериализуются в sanitized GPX `<trk><type>` или
+`<metadata><keywords>`, поскольку interoperable vocabulary для taxonomy отсутствует.
 
 ## Контекст
 
@@ -25,9 +30,22 @@ TrailBase — каталог треков. Требуется модель кл�
      - другие: 3-level enum `easy/moderate/hard` fallback.
    - **Season** — bitmask `{spring, summer, autumn, winter}`; year-round = все четыре,
      mask 0 = unknown.
-   - **Duration** — seconds numeric; source ∈
-     `{gpx_moving, gpx_elapsed, manual, estimated, unknown}`.
+   - **Duration** — integer seconds; source ∈
+     `{gpx_moving, gpx_elapsed, manual, estimated, unknown}`. Default выбирается
+     moving → elapsed → unknown; manual value находится в диапазоне
+     `1..31_536_000`, unknown хранится как `NULL`, zero запрещён. Outlier comparison
+     использует moving, иначе elapsed; `max(manual / auto, auto / manual) > 10`
+     требует warning confirmation, но не блокируется. Без auto candidate warning нет.
+     Durable acknowledgement привязано к manual value, comparison source/value и
+     algorithm version; оно переживает resume/takeover и инвалидируется при изменении
+     этих inputs или reparse. Moderator видит comparison и acknowledgement как
+     informational flag без automatic reject или queue reprioritization и не меняет
+     duration напрямую: correction после `changes_requested` делает автор в новом
+     immutable revision.
 3. **Auto-suggestion при загрузке** (предсказание рудиментарным классификатором на скорость+размах высот) — подсказка загрузчику; финальный выбор — человеком. Делается на профиле GPX, не server-side тяжёлым ML.
+4. **GPX export** не вводит отдельное versioned mapping activity/difficulty/tags в
+   свободные `<trk><type>` или `<metadata><keywords>`; canonical classification
+   публикуется через track page и JSON API.
 
 ## Альтернативы рассмотренные
 

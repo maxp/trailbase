@@ -1,7 +1,7 @@
 # TrailBase — Grill-me Checkpoint
 
 Статус: paused
-Дата: 2026-07-29
+Дата: 2026-07-30
 
 Принятые решения сохранены в
 [Implementation Contract](IMPLEMENTATION-CONTRACT.md). Этот файл хранит только точку
@@ -9,17 +9,17 @@
 
 ## Последнее подтверждённое решение
 
-Если после ACK/rotation search query завершается timeout/transient error, новый
-callback state удаляется, а старый ID не восстанавливается. Прежний result content
-остаётся видимым, но terminal edit убирает controls и предлагает повторить `/search`,
-используя принятый provider retry policy.
+Raw GPX не шифруется и не преобразуется приложением. Private S3 object хранит exact
+original upload bytes; data/master keys, crypto envelope, keyring, rewrap и decrypt
+path для raw отсутствуют. `raw_objects` сохраняет только storage/lifecycle metadata,
+quota/reference/cleanup model остаётся без изменений.
 
 ## Следующий вопрос
 
-Разрешать ли одному пользователю несколько одновременно незавершённых upload flows в
-private chat?
+Допустимо ли transparent provider-side SSE или disk encryption для raw storage?
 
-Рекомендация: да, до уже принятого лимита трёх active upload/parse jobs, но без
-неявного «текущего upload». Каждый status/control/metadata prompt связывается с
-конкретным `upload_job_id`; свободный текст принимается только как reply на prompt
-этого job, иначе bot просит выбрать upload.
+Рекомендация: да, как deployment control. TrailBase всё равно записывает и читает
+exact original bytes и не знает о шифровании диска/S3 provider; это не возвращает
+application envelope, keys или decrypt path. Если требование «без шифрации» означает
+запрет любого at-rest encryption, нужно явно запретить SSE/disk encryption и в
+infrastructure configuration.

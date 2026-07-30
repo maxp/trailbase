@@ -7,6 +7,13 @@
 revision; точная zoom-матрица и tolerances зафиксированы в
 [Implementation Contract](../IMPLEMENTATION-CONTRACT.md#17-map-delivery-и-browser-state).
 
+**Уточнение 2026-07-30:** один GPX attachment создаёт один draft, включая файл с
+несколькими `<trk>`. Каждый валидный `<trkseg>` остаётся отдельным компонентом
+canonical MultiLineString в document order. Отдельный segment manifest не хранится;
+исходная hierarchy остаётся в original raw GPX. Multi-track/route parse сохраняет
+только scalar track/route/valid-segment counts и показывает неблокирующий warning
+рядом с preview; отдельного confirmation gate до final submit нет.
+
 ## Контекст
 
 TrailBase показывает треки на карте. Требуется архитектура доставки геоданных, которая: (а) использует **готовые OpenStreetMap-тайлы** (по прямому требованию пользователя — «не генерируем тайлы»); (б) масштабируется на десятки тысяч треков; (в) не требует генерации MVT/раstup-tile pipeline (Martin, pg_tileserv, tileserver-gl отKeyep на ROI).
@@ -23,6 +30,13 @@ TrailBase показывает треки на карте. Требуется а
 3. **Pre-computed упрощённые геометрии** в PostGIS: 3 уровня (z11/z13/z15) в колонках `geometry_simplified_z11/13/15` при загрузке трека. On-the-fly `ST_Simplify` только как fallback.
 4. **Запрос:** `/api/tracks?bbox=...&zoom=...` → PostGIS `ST_Intersects(geometry, bbox)` + zoom-aware выбор колонки.
 5. **Raw GPX-файлы + фото — в S3** (см. A07). PostGIS хранит только распарсенную geometry и метаданные.
+6. **Сегменты GPX**: один attachment не разделяется автоматически на несколько
+   drafts. Компоненты `MultiLineString` следуют document order и сами сохраняют
+   segment boundaries. Исходная `<trk>/<trkseg>` hierarchy отдельно не
+   материализуется и при необходимости читается повторно из original raw GPX.
+   Route-only GPX использует те же one-attachment/one-draft правила. Scalar
+   source-track/source-route/valid-segment counts питают неблокирующий draft/final
+   warning; final submit является единственным confirmation всего snapshot.
 
 ## Альтернативы рассмотренные
 
