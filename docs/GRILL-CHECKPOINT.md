@@ -1,7 +1,7 @@
 # TrailBase — Grill-me Checkpoint
 
 Статус: paused
-Дата: 2026-07-30
+Дата: 2026-07-31
 
 Принятые решения сохранены в
 [Implementation Contract](IMPLEMENTATION-CONTRACT.md). Этот файл хранит только точку
@@ -9,17 +9,19 @@
 
 ## Последнее подтверждённое решение
 
-Raw GPX не шифруется и не преобразуется приложением. Private S3 object хранит exact
-original upload bytes; data/master keys, crypto envelope, keyring, rewrap и decrypt
-path для raw отсутствуют. `raw_objects` сохраняет только storage/lifecycle metadata,
-quota/reference/cleanup model остаётся без изменений.
+`track_issues.code` хранится как `text NOT NULL` с DB CHECK на
+`raw_object_missing`, `raw_integrity_mismatch`, `sanitized_export_missing` и
+`snapshot_integrity_unknown`, без PostgreSQL enum. Unknown code отклоняется; новый
+code требует migration существующего CHECK вместе с checker, subject constraint и
+capability mapping.
 
 ## Следующий вопрос
 
-Допустимо ли transparent provider-side SSE или disk encryption для raw storage?
+Должна ли БД отдельным CHECK контролировать допустимые пары
+`track_issues.code`/`subject_type`?
 
-Рекомендация: да, как deployment control. TrailBase всё равно записывает и читает
-exact original bytes и не знает о шифровании диска/S3 provider; это не возвращает
-application envelope, keys или decrypt path. Если требование «без шифрации» означает
-запрет любого at-rest encryption, нужно явно запретить SSE/disk encryption и в
-infrastructure configuration.
+Рекомендация: да. `raw_object_missing` и `raw_integrity_mismatch` допускают только
+`raw_object`; `sanitized_export_missing` и `snapshot_integrity_unknown` — только
+`revision`. Начальный набор не допускает row с `subject_type = track`; этот тип
+зарезервирован для будущего track-wide code, который одной migration расширит оба
+CHECK. Так ошибка application mapping не сможет записать issue к неверному subject.

@@ -3,6 +3,12 @@
 **Status**: Accepted
 **Date**: 2026-07-25
 
+**Уточнение 2026-07-31:** transparent provider-side SSE или disk encryption raw
+storage допустимы как deployment control. TrailBase не управляет provider keys или
+key IDs и получает после GET те же exact original bytes без application decrypt
+path. Для integrity хранится private SHA-256, вычисленный при streaming upload;
+keyed HMAC и отдельный application secret не используются.
+
 **Уточнение 2026-07-30:** raw GPX private и хранится как exact original upload bytes
 без application encryption или преобразования; наружу выдаётся отдельный sanitized
 export. Objects используют opaque UUID keys, согласование с БД идёт через upload
@@ -27,8 +33,10 @@ download и objects фотографий. PostGIS-geometry — это processed 
 2. **Доступ из Clojure-бэкенда**: **aws-simple-sign** (SigV4 подпись, zero-dep) + **hato** (transport с прокси) — см. A08. Subiesto одной HTTP-стеке для bot API, S3, и external fetches.
 3. **Паттерн**:
    - Upload: exact original raw bytes записываются без application encryption под
-     opaque UUID key, затем async job создаёт private revision в PostGIS. Raw
-     доступен только backend workers для parse/re-parse; public/owner download route,
+     opaque UUID key, затем async job создаёт private revision в PostGIS. Transparent
+     provider-side SSE/disk encryption может быть включено на deployment: приложение
+     не управляет его keys/key IDs и после GET получает исходные bytes. Raw доступен
+     только backend workers для parse/re-parse; public/owner download route,
      presigned raw URL и HTTP streaming endpoint отсутствуют. После successful parse
      raw не имеет отдельного TTL: он хранится до физической очистки связанного
      draft/track, включая published и archive/appeal retention, и всё время входит в
@@ -39,7 +47,102 @@ download и objects фотографий. PostGIS-geometry — это processed 
      нового upload переиспользует ссылку на existing object и не копирует source
      bytes; quota считает object один раз, cleanup ждёт последнюю durable reference.
      Отдельная PostgreSQL table `raw_objects` владеет `owner_id`, opaque S3 key,
-     exact `byte_size`, private HMAC, lifecycle state и timestamps.
+     exact `byte_size`, private SHA-256, lifecycle state и timestamps. Digest
+     вычисляется при streaming upload, проверяется при последующих чтениях/re-parse,
+     не публикуется и не используется для dedup или различимого поведения API.
+     Mismatch уже `ready` raw обрабатывается fail-closed без нового lifecycle state:
+     текущий parse/re-parse получает permanent `raw_integrity_mismatch` без automatic
+     retry и без revision/publication mutation, operator alert содержит только
+     `raw_object_id`, а row/object сохраняется по обычному retention для диагностики
+     или восстановления. Следующая попытка снова проверяет digest; если
+     восстановление невозможно, пользователь загружает source заново.
+     Application/admin repair flow отсутствует. Infrastructure operator может
+     восстановить под тем же opaque key только exact bytes с тем же stored SHA-256
+     из MinIO versioning/off-host backup; digest не меняется. Без совпадающей копии
+     пользователь делает новый upload/new `raw_object_id`, а другой source нельзя
+     подставить в прежнюю raw row.
+     После primary purge raw может оставаться только в encrypted operator-only
+     off-host backup максимум 30 дней, недоступен приложению и не восстанавливается
+     в active service. После PostgreSQL/WAL restore и migrations при остановленных
+     web/workers operator запускает CLI reconciliation до открытия traffic.
+     PostgreSQL является единственным источником references: любой
+     TrailBase-managed S3 key без единой durable DB reference является orphan и
+     удаляется со всеми versions/delete markers; referenced key не удаляется.
+     Manifest/pending approval/reconciliation rows не хранятся.
+     CLI default выполняет dry-run с counts/total bytes по storage class и nonzero
+     exit при DB/S3 scan error. Удаление требует explicit destructive flag и нового
+     полного scan при остановленных web/workers; dry-run result не сохраняется.
+     Dry-run не меняет DB. Destructive run удаляет orphans и durable помечает все
+     referenced-but-missing objects. Полный успешный scan/cleanup с однозначными
+     track markers разрешает degraded startup; incomplete scan или unmappable
+     violation оставляет traffic закрытым.
+     Referenced-but-missing S3 object не удаляет DB reference: CLI ставит связанному
+     track durable problem marker с admin-only reason code и безопасным пояснением.
+     Administrator видит точную причину, owner — только нейтральный факт проблемы с
+     записью. Тот же marker допускает другие track data-integrity problems.
+     Reason блокирует только dependent capabilities: missing raw — re-parse, missing
+     sanitized export — download/publication switch; исправные geometry/metadata
+     остаются доступны. Full track lock используется только для snapshot-wide
+     integrity reason, generic owner warning показывается всегда.
+     Несколько проблем хранятся отдельными `track_issues` rows с
+     `code text NOT NULL`, admin-only detail и detected/resolved timestamps. `code`
+     имеет DB CHECK только на `raw_object_missing`, `raw_integrity_mismatch`,
+     `sanitized_export_missing` и `snapshot_integrity_unknown`, без PostgreSQL enum;
+     новый code требует migration существующего CHECK, checker, subject constraint
+     и mapping. Отдельной scope column нет: blocked capabilities выводятся из
+     закрытого code mapping. Derived
+     `has_problems` означает наличие active rows; effective capability block является
+     union mappings active codes.
+     Initial mapping:
+     `raw_object_missing|raw_integrity_mismatch -> reparse`,
+     `sanitized_export_missing -> download+publication_switch`,
+     `snapshot_integrity_unknown -> full_track_lock`. Unknown code отклоняется; новый
+     требует migration, checker, subject constraint и mapping.
+     `subject_id` является UUID NOT NULL: track-wide issue использует
+     `track`/`track_id`, raw — `raw_object`/`raw_objects.id`, revision и sanitized
+     export — `revision`/`track_revisions.id`. `subject_type` — text с DB CHECK
+     `track|raw_object|revision`, без PostgreSQL enum; отдельный CHECK требует для
+     track subject равенство `subject_id = track_id`. Stable active identity
+     `(track_id, code, subject_type, subject_id)` защищена partial unique constraint
+     без NULL/sentinel semantics. Повторный detection сохраняет `detected_at`,
+     обновляет `last_seen_at`/detail; recurrence после resolution создаёт новый
+     incident.
+     `track_id` имеет FK, но polymorphic `subject_id` является historical UUID без
+     FK, retention pin или storage-reference semantics. Checker под track lock
+     проверяет subject membership; CHECK для `track` требует
+     `subject_id = track_id`. Purge subject не блокируется historical issue.
+     Storage issue получает `resolved_at` только после successful detector-specific
+     recheck object/integrity metadata. Admin может запустить recheck и добавить
+     append-only audit note, но не force-clear issue; row остаётся в history.
+     Отсутствие user notifications не создаёт другого resolution path.
+     Изменения issue state не создают user notification, web-inbox record или
+     messenger delivery. Owner видит только текущий derived `has_problems` и generic
+     warning в track views; codes/details/history остаются admin-only.
+     Issue-state transactions сериализуются `SELECT ... FOR UPDATE` на `tracks` row.
+     Если operation также нужен owner lock, применяется порядок `user -> track`;
+     standalone issue operation блокирует только track. Advisory locks не
+     используются, partial unique index остаётся DB backstop.
+     Preliminary scan только находит candidate; authoritative detector-specific
+     check повторяется под `tracks FOR UPDATE` в изменяющей issue transaction.
+     Timeout/error откатывает её без изменения issue state. Под lock выполняется
+     одна attempt с hard deadline 10 секунд, без retry/backoff; следующая attempt
+     всегда является новой operation с новым lock. Отдельных retry rows/stream/job
+     нет: CLI/admin возвращают safe failure, explicit rerun выполняет
+     operator/administrator, logs/metrics фиксируют attempt.
+     Checker возвращает `problem_present`, `healthy` или `inconclusive`.
+     Conclusive problem создаёт/обновляет active issue и `last_seen_at`; healthy
+     ставит `resolved_at`; inconclusive откатывает transaction без issue mutation.
+     S3 `404`/`NoSuchKey` и completed-read SHA-256/size mismatch являются
+     `problem_present`; exact match — `healthy`; access/permission/`429`,
+     DNS/TLS/network/timeout, `5xx`, truncated/unexpected response —
+     `inconclusive` с operational alert, без track issue mutation.
+     Raw `healthy` подтверждает только full streaming GET с пересчётом SHA-256/size
+     по body против `raw_objects`, без full-body memory buffer. HEAD/ETag/custom
+     metadata не resolve-ят integrity issue и не заменяют private digest. Read cap
+     равен stored `byte_size + 1`: extra byte conclusive size mismatch и закрывает
+     stream без скачивания остатка. Clean short EOF — conclusive size mismatch,
+     transport abort/broken framing/premature EOF — `inconclusive`; SHA сравнивается
+     только после exact-size EOF.
      `upload_jobs.raw_object_id` и
      `track_revisions.raw_object_id` ссылаются на неё; revision snapshots не
      дублируют storage metadata.
@@ -60,10 +163,12 @@ download и objects фотографий. PostGIS-geometry — это processed 
      upload error хранится в job, delete retries/DLQ — в command, поэтому raw
      `error`/`deleted` states отсутствуют.
      Cleanup command несёт только `raw_object_id`. Worker читает key из current
-     `delete_pending` row; S3 DELETE success/`404`, missing row при replay и crash
-     между S3/DB delete обрабатываются идемпотентно. Wrong state или retained FK
-     fail-closed проходят retry/DLQ+alert; storage metadata в outbox не
-     копируется.
+     `delete_pending` row, пагинированно перечисляет и удаляет по version ID все
+     versions/delete markers exact key. Prefix matches других keys не удаляются;
+     только empty exact-key listing разрешает physical row delete. Missing
+     version/object/row и crash между S3/DB delete обрабатываются идемпотентным
+     replay. Wrong state или retained FK fail-closed проходят retry/DLQ+alert;
+     storage metadata в outbox не копируется.
      Quota считает `pending` как fixed 10 MiB reservation без доверия внешнему size,
      `ready` — по actual bytes, `delete_pending` — как zero с момента
      commit. Terminal upload failure ставит `delete_pending` сразу; 24-hour janitor
