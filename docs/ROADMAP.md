@@ -93,9 +93,30 @@ explicit identity linking, roles и active-session management.
 - UI locale выбирается только из `ru`/`en` и применяется к bot и web UI.
   Поддерживаемый provider language служит initial hint, но не перезаписывает ручной
   выбор. `simple` остаётся техническим content fallback, не user locale.
-- Security notifications и action-required moderation (`changes_requested`,
-  `rejected`) locked-on и всегда доставляются в web inbox/primary bot. Catalog,
-  informational и остальные moderation results являются configurable preferences.
+- Security notifications и action-required moderation (`changes_requested`) locked-on
+  и всегда доставляются в web inbox/primary bot. Catalog, informational и остальные
+  moderation results являются configurable preferences.
+- `changes_requested` notification показывает локализованный actionable label
+  сохранённого correction code и optional owner-visible note; delivery не принимает
+  отдельный free-form reason, note не логируется.
+- Moderator removal/hide также locked-on для active account, включая full-lock
+  containment: lifecycle transaction атомарно создаёт moderation audit, web-inbox
+  record и primary-bot outbox. Решение использует `reason_code text NOT NULL` с DB
+  CHECK на `policy_violation|privacy_or_safety|legal_request|spam|duplicate|technical_containment|other`,
+  без PostgreSQL enum. Optional audit-only `reason_note` обязателен для `other`, после
+  trim содержит 1–1000 Unicode code points без control/newline и не показывается
+  owner-у или в logs. Notification содержит только removal fact, локализованный
+  public-safe reason label, short track ID, `TRAILBASE_SUPPORT_URL` и 90-day
+  purge/appeal deadline;
+  `technical_containment` показывается как generic «Техническая недоступность».
+  Full lock, `track_issues.code/detail`, snapshot и internal data не копируются.
+  Deactivated-account suppression действует без backlog/replay.
+- Первый committed appeal outcome также locked-on: та же transaction сохраняет
+  web-inbox record и primary-bot outbox. Uphold показывает confirmation fact, short
+  track ID и purge deadline без second-appeal action. Restore даёт canonical link для
+  published либо edit/resubmit action для private branch. Admin reason/note, actor,
+  audit ID/internal context скрыты; failure/conflict/retry не создают новую
+  notification, deactivated-account suppression действует без backlog/replay.
 - Изменения `track_issues` не являются notification category: detection, resolution
   и recurrence не создают web-inbox records или messenger deliveries. Owner видит
   только текущий generic `has_problems` в track views.
@@ -122,8 +143,9 @@ explicit identity linking, roles и active-session management.
   dispatcher не перечитывает settings.
 - «Мои треки/черновики» показывает в chat единый список owned tracks и
   upload/draft flows со статусами `draft`, `processing`, `pending_review`,
-  `changes_requested`, `published`, `rejected`. Требующие действия пользователя
-  элементы идут первыми, остальные — по последнему изменению; web session не нужна.
+  `changes_requested`, `published`; отдельного track state `rejected` нет. Требующие
+  действия пользователя элементы идут первыми, остальные — по последнему изменению;
+  web session не нужна.
 - Archived tracks скрыты из default list и доступны через вторичный filter «Архив».
   Карточка показывает оставшийся срок до 30-дневного purge и действие
   «Восстановить»; early permanent delete в MVP отсутствует.
@@ -139,8 +161,7 @@ explicit identity linking, roles и active-session management.
 - Карточка показывает только допустимые для текущего статуса действия:
   редактирование для `draft`/`changes_requested`, прогресс/cancel для `processing`,
   read-only просмотр для `pending_review`, просмотр/download/new revision/archive
-  для `published`, причину и новую исправленную revision для `rejected`.
-  Delete/archive требуют отдельного подтверждения.
+  для `published`. Delete/archive требуют отдельного подтверждения.
 - Список показывает 10 элементов на страницу с controls «Назад»/«Далее» и
   deterministic server-side keyset cursor. Provider callback содержит только opaque
   ID; cursor и provider/chat/message/requester binding хранятся в Valkey.
@@ -202,8 +223,8 @@ explicit identity linking, roles и active-session management.
 - In-flight parse деактивированного owner может завершиться только private draft.
   `pending_review` сохраняет status, но исключается из moderator queue; publish
   fail-closed re-check-ит active owner. Реактивация возвращает pending item в очередь
-  без resubmit, а draft пользователь отправляет сам. Новый `suspended` status не
-  вводится.
+  без resubmit после `export_state = ready`, а draft пользователь отправляет сам.
+  Новый `suspended` status не вводится.
 - Deactivation и approve/publish используют owner row lock и единый порядок
   `user -> track -> revision`. Первый commit определяет результат: approval-first
   оставляет опубликованный track public после деактивации, deactivation-first не
@@ -235,6 +256,11 @@ explicit identity linking, roles и active-session management.
   messenger identities, roles и audit.
 - `GET /auth` показывает confirmation; `POST /auth` атомарно расходует token и выдаёт
   `__Host-trailbase_session`, но не активирует account.
+- Browser re-auth переиспользует тот же bot-issued `web_session` token и `/auth`
+  GET/POST без отдельного credential/table/cookie/consume endpoint. Token выдаётся
+  только после fresh bot authentication и хранит её `fresh_authenticated_at`; новая
+  session rotate-ит текущую session браузера и переносит этот timestamp. Обычные
+  requests, `last_seen_at` и sliding TTL не продлевают absolute 10-minute freshness.
 
 **Acceptance**:
 - Первый валидированный Telegram `/start` в private one-to-one chat для неизвестной
@@ -403,25 +429,62 @@ private draft → moderated immutable revision.
 - M03 migration добавляет `raw_objects` как durable owner/storage entity и
   `raw_object_id` foreign keys в `upload_jobs` и `track_revisions`; snapshots не
   дублируют S3 storage fields.
+- Та же migration добавляет nullable `track_revisions.base_revision_id`. First
+  publication использует `NULL`; update published track сохраняет current revision
+  при создании. Composite same-track FK `(track_id, base_revision_id)` ссылается на
+  `(track_id, id)`, DB CHECK запрещает self-reference. Approval под track lock требует
+  совпадения `tracks.current_revision_id` с baseline; mismatch оставляет revision
+  stale без mutation/audit или automatic rebase.
+- Та же migration добавляет nullable `track_revisions.correction_of_revision_id` с
+  composite same-track FK на `(track_id, id)` и запретом self-reference. Поле
+  обязательно только для авторского resubmit после `changes_requested`, указывает на
+  непосредственно возвращённую immutable revision и равно `NULL` для остальных
+  revisions; resubmit сохраняет её `base_revision_id`.
+- Assignment schema для обычной track moderation не создаётся: у revision/queue нет
+  `assigned_to`, claim lease или отдельной claim table.
+- Та же migration добавляет
+  `track_revisions.submitted_for_review_at timestamptz NOT NULL`, атомарно
+  устанавливаемый при submit immutable revision и неизменяемый после него. Queue
+  index поддерживает порядок `(submitted_for_review_at, id)`.
 - Та же migration добавляет `track_issues` с `track_id`, `code text NOT NULL`,
-  `subject_type text NOT NULL`, `subject_id UUID NOT NULL`, admin-only detail,
-  `detected_at`, `last_seen_at` и `resolved_at`; `code` имеет DB CHECK только на
-  `raw_object_missing`, `raw_integrity_mismatch`, `sanitized_export_missing` и
-  `snapshot_integrity_unknown`, без PostgreSQL enum. Отдельной scope column нет,
+  `subject_type text NOT NULL`, `subject_id UUID NOT NULL`, admin-only
+  `detail text NOT NULL`, `detected_at`, `last_seen_at` и `resolved_at`;
+  `char_length(detail) BETWEEN 1 AND 1000` защищён DB CHECK, а application пишет
+  только code-specific безопасные шаблоны без raw exceptions, HTTP
+  headers/provider body, GPX content или credentials. Detail не использует `jsonb`;
+  машинная семантика остаётся в `code`. Шаблоны образуют закрытый каталог с явным
+  whitelist подстановок; в MVP разрешены только тип mismatch и точно известные
+  expected/observed byte counts. Oversized read, остановленный на `expected + 1`,
+  сообщает только lower bound observed size. `subject_id`, object key/bucket,
+  filename, digest, provider response/status, exception и operator free text не
+  подставляются; ручной текст остаётся append-only audit note. Rendered detail
+  хранится только на canonical English, не зависит от `ru`/`en` UI locale и не
+  переписывается при её смене; admin UI локализует labels/actions, но показывает
+  stored diagnostic text. `code` имеет DB CHECK только на `raw_object_missing`,
+  `raw_integrity_mismatch`,
+  `sanitized_export_missing` и `snapshot_integrity_unknown`, без PostgreSQL enum.
+  Отдельной scope column нет,
   blocked capabilities выводятся из закрытого mapping:
   `raw_object_missing|raw_integrity_mismatch -> reparse`,
   `sanitized_export_missing -> download+publication_switch`,
   `snapshot_integrity_unknown -> full_track_lock`. Unknown code отклоняется, новый
   требует migration существующего CHECK, checker, subject constraint и mapping.
   `subject_type` имеет CHECK только на `track|raw_object|revision`, без PostgreSQL
-  enum; partial unique index по
+  enum. Compound CHECK допускает только
+  `raw_object_missing|raw_integrity_mismatch` с `raw_object` и
+  `sanitized_export_missing|snapshot_integrity_unknown` с `revision`; начальный
+  набор не допускает `track`, а первый track-wide code расширяет code CHECK и pair
+  CHECK.
+  Partial unique index по
   `(track_id, code, subject_type, subject_id)` для active rows не допускает duplicate
   incident; `has_problems` вычисляется через active rows, а не хранится mutable
   boolean в `tracks`. Track-wide issue использует `track`/`track_id`, raw —
   `raw_object`/`raw_objects.id`, revision/export — `revision`/`track_revisions.id`;
   nullable subject/sentinel не используются. `track_id` имеет FK, polymorphic
   `subject_id` FK не имеет, не pin-ит subject и не считается storage reference;
-  membership проверяется checker-ом под track lock. CHECK для `track` требует
+  membership проверяется checker-ом под track lock. Пока track существует, purge
+  raw/revision может оставить historical subject UUID; physical purge track удаляет
+  все active/resolved issue rows. CHECK для `track` требует
   `subject_id = track_id`; новый type требует migration CHECK и application keyword.
 - `track_revisions.raw_object_id` для GPX-derived snapshots использует
   `ON DELETE RESTRICT`; nullable `upload_jobs.raw_object_id` — `ON DELETE SET NULL`.
@@ -445,12 +508,27 @@ private draft → moderated immutable revision.
   takeover сохраняют acknowledgement, а duration change/reparse/version change
   инвалидируют. Valkey содержит только prompt/control token.
 - Track moderation summary показывает acknowledged duration outlier: manual value,
-  comparison auto value/source и ratio. Flag не вызывает automatic reject и не
-  меняет queue priority.
+  comparison auto value/source и ratio. Flag не вызывает automatic moderation
+  decision, не меняет `submitted_for_review_at` или FIFO position.
 - Moderator не редактирует pending track revision: approve as-is либо
-  `changes_requested` с причиной. Авторская правка создаёт новый immutable revision,
-  повторно запускает validation/outlier acknowledgement и может переиспользовать raw
-  GPX; administrative repair остаётся отдельной audited operation.
+  `changes_requested` с одним `reason_code text NOT NULL`, DB CHECK на
+  `metadata_correction|geometry_correction|privacy_correction|classification_correction|license_or_attribution|other`
+  и optional owner-visible `reason_note`. Note обязателен для `other`, после trim
+  содержит 1–1000 Unicode code points без control/newline и не логируется. Array,
+  checklist relation и PostgreSQL enum отсутствуют; несколько проблем перечисляются
+  в note. Авторская правка создаёт новый immutable revision, повторно запускает
+  validation/outlier acknowledgement и может переиспользовать raw GPX;
+  administrative repair остаётся отдельной audited operation.
+- Первая публикация получает full-snapshot moderator review. Для новой revision уже
+  опубликованного track review по умолчанию показывает field diff и overlay старой и
+  новой geometry относительно сохранённого `base_revision_id`; полный pending
+  snapshot открывается отдельным действием. Любой moderation outcome применяется ко
+  всей immutable revision, partial approval нет.
+- Review авторского resubmit после `changes_requested` вместо этого по умолчанию
+  показывает correction diff относительно `correction_of_revision_id` и сохранённые
+  correction code/note. Total diff относительно `base_revision_id` и полный pending
+  snapshot доступны как вторичные views; решение по-прежнему применяется ко всей
+  revision.
 - Raw GPX сохраняется без application encryption или преобразования: private S3
   object содержит exact original upload bytes. Data/master keys, crypto envelope,
   keyring, rewrap и decrypt path для raw отсутствуют.
@@ -504,7 +582,37 @@ private draft → moderated immutable revision.
 - Marker блокирует reason-scoped capabilities, а не весь track: missing raw запрещает
   re-parse, missing sanitized export — download/publication switch, но исправная
   geometry и metadata view остаются доступны. Full lock используется только для
-  snapshot-wide integrity reason; generic owner warning показывается всегда.
+  snapshot-wide integrity reason. Он блокирует normal content serving,
+  owner/content и publication mutations, restore, approve и content-dependent
+  moderation. Allowlist: minimal status с generic owner warning, owner archive,
+  moderator removal/hide, scheduled purge, admin issue/history read,
+  detector-specific recheck/resolution и append-only audit; containment не читает и
+  не публикует snapshot.
+- Full-lock owner projection содержит только `track_id`, lifecycle `status`,
+  `has_problems = true`, `purge_at` для archived track, localized generic warning и
+  доступное действие «Архивировать». Карточка использует generic title/short track ID
+  без revision read. Name/descriptions, geometry, metrics, POI, classification,
+  author, `current_revision_id`, export/raw IDs, issue semantics и blocked capability
+  list отсутствуют; archived card скрывает restore и показывает purge deadline.
+- Blocked owner mutation получает terminal `409 Conflict`, `Cache-Control: no-store`
+  и JSON `{"error":"track_temporarily_unavailable"}` либо localized generic HTML
+  partial. Bot даёт neutral acknowledgement, не меняет domain state и обновляет
+  minimal card; domain rejection не retry-ится/DLQ-ится. `423`, `Retry-After`, issue
+  details и capability list отсутствуют; `503` остаётся public/infrastructure status.
+- Moderator без admin issue permissions видит full-locked track в существующем
+  moderation surface как snapshot-free placeholder без новой queue: только
+  `track_id`, lifecycle `status`, `has_problems = true`, generic warning и
+  removal/hide с обязательной причиной. Preview/approve/changes-requested,
+  export retry/download и content/revision fields скрыты. Issue history/recheck
+  требуют отдельных admin permissions, которые не обходят content lock.
+- Stale/direct moderator content mutation после auth/permission/visibility checks
+  получает тот же terminal `409`/`no-store`/safe JSON error либо generic HTML, не
+  создавая domain mutation или audit decision; UI обновляется до placeholder. `403`
+  означает missing permission, `404` — invisible/removed resource, `503` — infra
+  failure. Capability rejection не retry-ится/DLQ-ится и не раскрывает issue.
+- Успешный removal/hide как containment атомарно создаёт обычный moderation audit и
+  locked-on owner notification/outbox; это lifecycle notification без full-lock или
+  issue details, а detector/recheck notification не создают.
 - Начальный mapping закрыт:
   `raw_object_missing|raw_integrity_mismatch -> reparse`,
   `sanitized_export_missing -> download+publication_switch`,
@@ -516,8 +624,9 @@ private draft → moderated immutable revision.
   capability mapping.
 - Несколько active `track_issues` не перезаписывают друг друга; effective blocked
   capabilities являются union code mappings; отдельной mutable scope column нет.
-  Owner получает только derived
-  `has_problems` и generic warning, administrator — все codes/details/timestamps.
+  Из issue-related данных owner получает только derived `has_problems` и generic
+  warning, administrator — все codes/details/timestamps; full-lock projection ниже
+  дополнительно ограничивает весь field set.
 - `subject_id` всегда UUID NOT NULL: track-wide issue повторяет `track_id`, raw
   ссылается идентификатором raw object, а revision/export — revision ID. Поэтому
   partial unique active identity не имеет NULL loophole. Subject UUID является
@@ -526,20 +635,54 @@ private draft → moderated immutable revision.
 - `subject_type` — text с закрытым DB CHECK
   `track|raw_object|revision`, не PostgreSQL enum. Unknown value отклоняется; track
   type дополнительно требует `subject_id = track_id`.
+- Compound DB CHECK допускает только пары
+  `raw_object_missing|raw_integrity_mismatch`/`raw_object` и
+  `sanitized_export_missing|snapshot_integrity_unknown`/`revision`. Ни один
+  начальный code не допускает `track`; первый track-wide code требует одной
+  migration code CHECK и pair CHECK.
+- Admin-only `detail` — `text NOT NULL` с DB CHECK
+  `char_length(detail) BETWEEN 1 AND 1000`, не `jsonb`. Application формирует его
+  только из code-specific безопасных шаблонов; raw exceptions, HTTP
+  headers/provider body, GPX content и credentials не сохраняются. Машинная
+  семантика остаётся в `code`. Каталог шаблонов закрыт; каждый шаблон имеет явный
+  whitelist. В MVP подставляются только тип mismatch и точно известные
+  expected/observed byte counts; остановка oversized read на `expected + 1`
+  сохраняет lower bound, не точный observed size. `subject_id`, object key/bucket,
+  filename, digest, provider response/status, exception и operator free text не
+  подставляются. Ручные пояснения администратора остаются append-only audit notes.
+  Rendered detail хранится только на canonical English, независимо от `ru`/`en` UI
+  locale, и не переписывается при её смене. Admin UI локализует labels/actions, но
+  показывает stored diagnostic text.
 - Issue закрывает только detector-specific successful recheck: storage checker
   проверяет object/integrity metadata, другие codes — свой validator. Administrator
   может запустить check и оставить append-only audit note, но не force-set
-  `resolved_at`; resolved rows не удаляются. Отсутствие user notifications не меняет
-  это правило.
+  `resolved_at`; resolved rows сохраняются до physical purge owning track. Purge
+  удаляет active/resolved issues без fake resolution; issue rows не являются
+  retention pin и не блокируют purge. Tombstone track UUID и существующий audit
+  остаются, но codes/details/subject UUID в новый audit event не копируются.
+  Отсутствие user notifications не меняет это правило.
+- Resolution последней active full-lock issue автоматически пересчитывает effective
+  block, меняя только `track_issues.resolved_at`. `tracks.status`,
+  `current_revision_id` и moderation records не меняются; если lifecycle state всё
+  ещё разрешает доступ, прежний immutable snapshot снова доступен без новой
+  moderation/publication operation. Archive/moderator removal сохраняются, а другие
+  active issues продолжают свои блокировки.
 - Повторный detection active identity обновляет `last_seen_at`/admin detail,
   сохраняя первый `detected_at`; после resolution recurrence создаёт новый incident
   ID. Изменения issue state не создают web-inbox records или messenger deliveries.
-  Owner получает только текущее derived `has_problems` и generic warning в track
-  views; codes/details/history остаются admin-only.
+  Из issue-related данных owner получает только текущее derived `has_problems` и
+  generic warning в track views; codes/details/history остаются admin-only.
 - Все issue-state transactions сериализуются `SELECT ... FOR UPDATE` на `tracks`
   row. Standalone operation блокирует только track; если owner lock нужен по другой
   причине, применяется порядок `user -> track`, без advisory locks. Partial unique
   active-identity index остаётся DB backstop.
+- Issue commit linearize-ит активацию full lock. Canonical single-track
+  detail/download держат конфликтующий `FOR SHARE` до response decision/signing,
+  mutations — `FOR UPDATE` до commit; оба повторно проверяют issues под lock.
+  Победившая до detector transaction operation завершается как pre-lock, после issue
+  commit новые operations видят block. Collection queries используют statement
+  snapshot без per-track locks и могут завершить начатый до commit response; уже
+  начатые HTTP/S3 responses не отменяются.
 - Preliminary scan только выбирает candidate. Финальный detector-specific check
   повторяется после `tracks FOR UPDATE` и меняет issue в той же transaction;
   timeout/error выполняет rollback без изменения issue state. Под lock разрешена
@@ -598,16 +741,202 @@ private draft → moderated immutable revision.
   `publishing` status отсутствует.
 - До approval private sanitized object доступен только backend workers. Owner и
   moderator работают через draft/review UI без presigned URL или отдельного
-  authenticated download route; moderator видит `export_state` и retry action.
-  Download появляется только после publication через canonical route.
-- Moderator queue показывает pending/error export badge и оставляет доступными review,
-  `changes_requested` и reject; Approve disabled до ready. После automatic retry
-  exhaustion moderator может идемпотентно requeue export, operator alert-ится, а
-  owner видит обычный `pending_review` без infrastructure details.
-- `changes_requested`/reject атомарно переводит export state в `discarded` и пишет
-  high-priority idempotent object delete. Export не переиспользуется новой revision;
-  late worker completion не меняет discarded state и удаляет созданный object через
-  retry/DLQ/alert.
+  authenticated download route. Download появляется только после publication через
+  canonical route.
+- Обычная moderator queue показывает только `pending_review` revisions active owners
+  с `export_state = ready`. `pending|error` items, export badges и retry action из неё
+  исключены. Pending остаётся technical progress; exhausted error попадает в
+  отдельный operator/admin operations view с idempotent retry и alert. Owner видит
+  обычный `pending_review` без infrastructure details. Snapshot-free full-lock
+  containment остаётся отдельным surface только с removal/hide и не зависит от
+  queue eligibility.
+- Queue общая для всех moderators с permission и не имеет assignment, claim lease,
+  heartbeat, hand-off или состояния «в работе». Decision transaction повторно
+  проверяет eligibility/invariants под row locks; первый commit сохраняет actual
+  actor в audit, а конкурентный submit получает deterministic conflict без второго
+  decision, audit или notification.
+- Currently eligible items идут строго FIFO по
+  `submitted_for_review_at ASC, track_revisions.id ASC` с keyset pagination по той же
+  паре. Priority/escalation field, manual bump, SLA buckets и resubmit priority не
+  вводятся; containment и export-error operations остаются отдельными surfaces.
+- Moderation UI принимает решение только по одной revision: без checkboxes, select
+  all, bulk endpoints, массивов IDs или batch jobs для approve,
+  `changes_requested`/removal. Успешный decision и конкурентный conflict возвращают
+  moderator-а в обновлённую общую FIFO queue; audit/outbox остаются per-revision.
+- Approve выполняется явной submit-кнопкой без confirmation modal. Для
+  `changes_requested` final submit заполненной correction code/note form является
+  единственным подтверждением. Controls disabled на время request, backend всё равно
+  повторно проверяет eligibility/invariants. Отдельный confirmation остаётся только у
+  moderator removal с немедленным hide и retention/appeal side effects.
+- Ordinary review постоянно показывает approve primary action и
+  `changes_requested` secondary action с inline correction form. Moderator removal
+  доступен отдельно в destructive danger-секции и не стоит рядом с обычными
+  outcomes. Full-lock containment остаётся removal-only exception.
+- Durable defer/snooze/second-review state для ordinary track item отсутствует.
+  Закрытие review не создаёт mutation/audit/notification и не меняет
+  `pending_review`, `submitted_for_review_at` или FIFO position; item остаётся
+  доступным всем moderators. Owner action использует `changes_requested`, terminal
+  case — removal.
+- Internal comments для undecided ordinary item не реализуются: нет
+  `moderation_comments`, drafts/replies, mentions, attachments или unread state.
+  Moderator data появляется только в outcome audit; correction/removal notes
+  принадлежат соответствующим decisions. Admin `track_issues` audit notes остаются
+  отдельным operations flow.
+- Ordinary queue — одна FIFO list eligible `pending_review` items с keyset
+  «Назад»/«Далее». Filters по revision kind/author/activity/reason, full-text search,
+  saved views/queries и per-filter counts не реализуются. Containment и export-error
+  operations остаются отдельными surfaces.
+- Queue row содержит только track name, localized `first|update|correction` kind и
+  submission time/age; действие одно — открыть review. Map/diff/correction/hint
+  preview и outcome controls в list отсутствуют. List query не загружает geometry или
+  иные тяжёлые snapshot data.
+- Queue/review не имеют WebSocket, SSE, auto-polling timer или presence transport.
+  Refresh выполняется при navigation/manual reload и после decision/conflict.
+  Открытая stale review допустима: authoritative transaction re-check возвращает
+  conflict и свежую queue; background row removal/re-render отсутствует.
+- Competing decision loser получает `409`, `no-store` и stable
+  `moderation_item_already_decided`. Web показывает neutral localized notice и свежую
+  FIFO queue без winner actor/outcome/reason или retry; второй audit/notification/
+  outbox не создаётся.
+- Stale direct HTML GET уже обработанного ordinary item после auth/permission checks
+  делает `303` в FIFO queue с neutral one-time notice. Historical read-only mode и
+  decision details в ordinary moderation отсутствуют; audit/history остаётся
+  отдельным permissioned admin view.
+- Approve, `changes_requested` и moderator removal сохраняются как append-only
+  immutable outcomes без undo, reopen, edit или delete decision в ordinary
+  moderation. Исправление после approve идёт новой owner revision либо отдельным
+  removal, после `changes_requested` — новым author resubmit, а пересмотр removal —
+  отдельным appeal/admin lifecycle. Корректировка всегда создаёт новый audit event и
+  не меняет исходный outcome или reason/note.
+- In-product appeal workflow отсутствует: нет owner form, `appeals` table, appeal
+  status, attachments/chat thread или отдельной appeal queue. Removal notification
+  направляет owner-а по `TRAILBASE_SUPPORT_URL` с short track ID и 90-дневным
+  deadline; support verification проходит out-of-band, после чего отдельная
+  permissioned admin operation пишет новый append-only audit event.
+- Appeal management UI начинается с единственного exact lookup field по полному track
+  UUID либо short track ID из notification/support case. Recent cases, queue, filters,
+  fuzzy search по названию/owner-у и saved cases отсутствуют. Только unique exact match
+  после permission/fresh-auth checks загружает sensitive context; collision short ID
+  требует полный UUID без automatic selection, а unknown/ambiguous lookup возвращает
+  одинаково нейтральный результат.
+- Short track ID вычисляется из последних 12 lowercase hex UUIDv7 `tracks.id` и
+  отображается как `trk-xxxx-xxxx-xxxx`; отдельные column/sequence/generator и UNIQUE
+  constraint не создаются. Lookup нормализует ASCII case, optional exact `trk-` и group
+  hyphens, затем принимает ровно 12 hex либо полный canonical UUID. Non-unique
+  expression index обслуживает short lookup, collision требует full UUID. Первые 8 hex
+  в GPX filename остаются отдельным display-only suffix и lookup key не являются.
+- Appeal case screen после lookup — одна read-only removal summary, переиспользующая
+  historical snapshot renderer, а не вторая moderation workspace. Она показывает
+  short/full ID, lifecycle state, original removal time, исходные reason code/note,
+  purge deadline, immutable decision snapshot, точный restore target и computed
+  eligibility со stable blocking class. Live owner/provider identity, editable fields,
+  support text/attachments и full audit timeline не копируются; support остаётся
+  out-of-band, отдельный case record не создаётся.
+- Server case projection отдаёт один derived/non-persisted `action_state`:
+  `decision_ready`, `restore_blocked_full_track_lock`,
+  `restore_blocked_export_unavailable`, `window_closed`, `not_current`,
+  `already_decided`.
+  Precedence: decided, not-current, closed window, full lock, missing export, ready.
+  Ready показывает обе кнопки, restore-blocked states — uphold и disabled restore с
+  coarse label, terminal states скрывают form, а decided показывает saved outcome.
+  Issue details не раскрываются; backend recompute под lock и refresh summary после
+  conflict являются source of truth, client eligibility logic отсутствует.
+- Appeal flow имеет отдельный HTML namespace `/admin/track-appeals`, не использующий
+  ordinary `/moderation/...`. GET root показывает exact `track_ref` lookup/summary;
+  обе кнопки POST-ят closed outcome/reason/idempotency payload в
+  `/admin/track-appeals/:removal_decision_id/decision`. Mutation требует admin, fresh
+  auth и session-bound CSRF. Htmx имеет full-page fallback; JSON/bot endpoints и route
+  aliases отсутствуют, все responses — `Cache-Control: no-store`.
+- Actionable form получает server-generated 128-bit CSPRNG base64url
+  `idempotency_key` в hidden field, общий для обеих outcome buttons и отдельный от
+  CSRF. Outcome хранит только UNIQUE SHA-256 `idempotency_key_hash`; raw key,
+  idempotency table, TTL/cleanup отсутствуют и key/hash не логируются. Same hash с
+  exact normalized removal/outcome/reason payload возвращает result; payload mismatch
+  даёт `409`/`no-store`/`idempotency_key_reused`, новый key после commit —
+  `appeal_already_decided`.
+- Successful commit и exact idempotent retry завершаются на одном canonical GET summary
+  с full track UUID: full-page POST использует `303 See Other`, htmx — client navigation
+  к тому же URL без отдельного success fragment. Summary показывает
+  `already_decided`, committed outcome и одинаковый статус «Решение сохранено».
+  Refresh не повторяет POST, short ID в canonical success URL не используется;
+  validation остаётся на form, conflict загружает fresh authoritative summary.
+- Decision POST error matrix едина для htmx/full-page: `422` сохраняет form values и
+  same idempotency key с field errors; `409` отбрасывает stale form/key и возвращает
+  fresh summary/action_state со stable code; `503` сохраняет values/key для manual
+  same-key retry без automation и не утверждает commit result. `422/409` не создают
+  outcome/audit/outbox; uncertain COMMIT разрешается idempotent retry. Все responses
+  `no-store`, internal stack/issue/provider/storage details скрыты.
+- Appeal/admin operation допускает только `uphold_removal` без lifecycle mutation и
+  state-changing `restore_after_appeal`. Каждый outcome содержит ссылку на исходный
+  removal decision, требует admin reason и создаёт новый append-only audit event, не
+  меняя исходный removal. Generic `resolved`, partial и custom/free-form outcomes не
+  вводятся.
+- Одна permission `track_appeal_decide` mapped только к фиксированной роли `admin` и
+  защищает оба outcome; отдельной uphold/restore permission нет. Management UI требует
+  existing fresh auth до sensitive audit context. Роль `moderator`, ordinary
+  moderation endpoints и bot action permission не получают; audit хранит actual
+  admin actor.
+- Final submit заполненной outcome+reason form является единственным confirmation для
+  appeal decision. Fresh-authenticated management form до submit показывает short
+  track ID, current state, выбранный outcome, его последствия и обязательную reason.
+  Две визуально разделённые кнопки называются «Подтвердить удаление» и «Восстановить
+  трек»; generic «Сохранить», второй modal и отдельный confirm screen отсутствуют.
+  Controls disabled in-flight; backend повторно проверяет permission, fresh auth,
+  single-shot и lifecycle invariants, а retry остаётся idempotent.
+- Appeal outcome использует тот же internal reason contract, что account reactivation:
+  `reason_code text NOT NULL` с CHECK на
+  `support_request_verified|administrative_correction|other`, без PostgreSQL enum.
+  Optional audit-only `reason_note` обязательна для `other`, после trim содержит
+  1–1000 Unicode code points без control/newline и не попадает в owner notification
+  или logs. Validation/UI переиспользуются, отдельного appeal catalog нет.
+- На `removal_decision_id` appeal outcome действует UNIQUE: первый commit является
+  terminal. Идемпотентный retry того же outcome возвращает сохранённый результат без
+  второго audit/outbox; competing или последующий другой outcome получает
+  `409`/`no-store`/`appeal_already_decided` без side effects. Reopen и second appeal
+  для того же removal отсутствуют; correction — новая permissioned lifecycle
+  operation, не изменение outcome.
+- `restore_after_appeal` возвращает прежний immutable approved `current_revision_id`
+  в published без ordinary re-moderation. Если approved revision до removal не было,
+  track возвращается только в private/editable state, а публикация требует явного
+  owner resubmit с новой immutable revision. Decided removed revision и её discarded
+  export никогда не возвращаются в ordinary queue.
+- Moderator removal сохраняет private sanitized export последнего approved current
+  snapshot до `uphold_removal` либо 90-day purge. В этот период canonical routes дают
+  `404`, новые presigned URL не создаются, object доступен только backend.
+  `restore_after_appeal` атомарно возвращает тот же snapshot в published и пишет
+  audit/outbox без regeneration job или `restoring` state; uphold/purge ставят
+  idempotent delete. Unapproved pending export по-прежнему сразу становится
+  `discarded` и удаляется.
+- Uphold не меняет original `purge_at`: export удаляется сразу, остальные retained
+  data — только в исходный 90-day deadline; immediate purge, extension и новый timer
+  отсутствуют. Restore атомарно ставит `purge_at = NULL`. Failure/conflict/retry срок
+  не меняют. Outcome и purge worker используют один track lock: first commit wins,
+  worker после restore видит NULL и не очищает track.
+- Первый новый uphold или restore под track lock требует current active removal,
+  отсутствующий outcome и `now() < purge_at`. Expiration закрывает обе операции даже
+  при lag purge worker-а, support request не продлевает окно; newer lifecycle state
+  также закрывает оба outcome. До deadline full-track lock и unavailable retained
+  export блокируют только restore, audit-only uphold остаётся доступным. Уже committed
+  outcome по-прежнему возвращается идемпотентным retry.
+- Restore transaction под track lock проверяет текущий `moderator_removed`, совпадение
+  active removal с `removal_decision_id`, deadline, отсутствие newer lifecycle event и
+  full-track lock, а для published branch — retained export readiness. Stale/blocked
+  request получает `409`/`no-store`/`appeal_not_restorable` без outcome, audit/outbox
+  или delete и может быть повторён после temporary resolution до deadline. Full lock
+  не запрещает audit-only uphold.
+- Первый committed appeal outcome атомарно пишет locked-on owner web-inbox и
+  primary-bot outbox. Uphold показывает fact/short ID/purge deadline без повторной
+  appeal action; restore — canonical link либо edit/resubmit. Internal admin fields не
+  раскрываются, failed/conflicting/idempotent request notification не создаёт;
+  deactivated-account suppression остаётся без backlog/replay.
+- `changes_requested` или moderator removal pending revision атомарно переводит
+  export state в `discarded` и пишет high-priority idempotent object delete. Export
+  не переиспользуется новой revision; late worker completion не меняет discarded
+  state и удаляет созданный object через retry/DLQ/alert.
+- Обычная track moderation имеет только approve/publish и `changes_requested`.
+  Отдельного track lifecycle state `rejected` нет; terminal policy, privacy/safety,
+  legal, spam и duplicate cases используют moderator removal с confirmation и
+  закрытым reason catalog. Статусы `rejected` других сущностей этим не меняются.
 - Submit использует автоматическое standing consent первого `/start`, показывает
   CC BY 4.0 reminder/link и не имеет отдельного agreement gate.
 - Sanitized GPX опубликованного track доступен анонимно через canonical download URL:
@@ -615,7 +944,8 @@ private draft → moderated immutable revision.
   до lookup/signing применяет 30 requests/min на normalized IP с burst 10 и выдаёт
   5-minute presigned redirect. `404` также расходует лимит; session его не повышает,
   S3 GET не учитывается. Private/archived/moderator-removed state отвечает одинаковым
-  `404`; bot не публикует signed URL.
+  `404`; otherwise published full-locked track отвечает generic `503` без metadata,
+  integrity details или `Retry-After`; bot не публикует signed URL.
 - Sanitized object не шифруется приложением и остаётся в private bucket. Presigned
   HTTPS URL отдаёт exact object напрямую без backend decrypt proxy; transparent
   provider-side SSE/disk encryption допустимы как deployment control и не меняют
@@ -623,6 +953,8 @@ private draft → moderated immutable revision.
 - Canonical download `302/404/429/5xx` всегда имеет `Cache-Control: no-store`; CDN
   cache и `ETag` для route отсутствуют. Каждый request повторяет limit/publication
   checks, а signed S3 URL живёт отдельно только пять минут.
+- Full lock прекращает выдачу новых signed URLs, но сам не ставит sanitized object на
+  deletion/rotation; ранее выданный URL живёт не более исходного five-minute TTL.
 - Canonical `/tracks/:track-id/download` всегда разрешает только current published
   revision. Старые revision exports не имеют public route и eligible для storage
   retention cleanup; approval новой revision переключает тот же URL без изменения
@@ -638,8 +970,10 @@ private draft → moderated immutable revision.
   8 lowercase hex track UUID и `.gpx`. Transliteration и raw upload filename не
   используются.
 - Переход current export в superseded/non-public пишет high-priority idempotent S3
-  delete с retry/DLQ/alert. После delete ранее выданный signed URL не работает; при
-  задержке доступ живёт не дольше исходных пяти минут. Отдельного download proxy нет.
+  delete с retry/DLQ/alert, кроме private retention последнего approved export после
+  moderator removal до appeal outcome/90-day purge. После delete ранее выданный
+  signed URL не работает; при задержке доступ живёт не дольше исходных пяти минут.
+  Отдельного download proxy нет.
 - Htmx-форма `/tracks/new`: upload создаёт async job; polling открывает private draft
   preview; пользователь подтверждает final summary и отправляет revision на
   moderation. Submit требует непустой final name и явно выбранный primary activity;
@@ -799,25 +1133,69 @@ private draft → moderated immutable revision.
 - Capability checks соответствуют reason: unrelated track operations проходят,
   dependent operation fail-closed. Missing raw/re-parse и missing
   export/download-or-publication-switch покрыты integration cases; full lock
-  применяется только к snapshot-wide integrity code. Scope выводится из code, а не
-  читается из отдельной issue column.
+  применяется только к snapshot-wide integrity code и блокирует normal content,
+  owner/content/publication mutations, restore, approve и content-dependent
+  moderation. Разрешены только minimal status/generic warning, owner archive,
+  moderator removal/hide, scheduled purge, admin issue/history read,
+  detector-specific recheck/resolution и audit. Containment не читает snapshot.
+  Scope выводится из code, а не читается из отдельной issue column.
+- Owner full-lock card строится без revision read и содержит только `track_id`,
+  lifecycle `status`, `has_problems = true`, optional `purge_at`, generic warning и
+  доступный archive action. Content/revision/issue fields отсутствуют; archived card
+  показывает purge deadline без restore.
+- Запрещённая full-lock owner mutation даёт terminal `409`/`no-store` и stable safe
+  JSON error либо generic HTML/bot acknowledgement без retry/DLQ и internal details.
+- Non-admin moderator получает в existing surfaces snapshot-free placeholder только
+  с removal/hide; обычные moderation/content actions скрыты, admin issue permissions
+  не дают bypass content lock.
+- Stale/direct moderator content action после permission/visibility checks получает
+  тот же terminal `409` без mutation/audit/retry; UI возвращается к placeholder.
+- Full-lock containment removal создаёт normal locked-on moderator-removal
+  notification для active owner с public-safe label закрытого removal reason code;
+  audit-only note и `track_issues.code/detail` не копируются, deactivated suppression
+  остаётся общей.
 - Две одновременные issues сохраняются отдельными rows; resolution одной оставляет
   `has_problems = true` и блокировки второй, а resolution последней снимает derived
   flag. Ни одно изменение не создаёт user notification.
 - Manual clear отсутствует: failed recheck оставляет issue active, successful
   detector-specific check заполняет `resolved_at`, а история row и admin audit
   сохраняются.
+- Resolution последней full-lock issue автоматически снимает только её derived
+  capability block. Lifecycle/moderation state и `current_revision_id` не меняются;
+  доступ прежнего immutable snapshot возвращается без повторной moderation только
+  если текущий lifecycle допускает его. Archive/removal и другие issues сохраняют
+  effect.
+- Search/map/catalog collection results исключают track под full lock. Прямые
+  canonical detail/download requests для otherwise published track получают generic
+  `503 Service Unavailable` с `Cache-Control: no-store`, без `Retry-After`, metadata
+  или integrity details; private/archived/moderator-removed resources сохраняют
+  одинаковый `404`. После resolution следующий request заново проверяет publication
+  и effective capabilities без cached failure.
+- Full lock не является non-public lifecycle transition и сам не удаляет/ротирует
+  sanitized object. Уже выданный presigned URL может работать до исходных пяти минут,
+  закэшированный GeoJSON — до 90 секунд; уже доставленный client content не
+  отзывается. Новые responses, увидевшие lock, не создают новый content access. После
+  resolution переиспользуется тот же immutable snapshot/export, если lifecycle это
+  разрешает; download proxy не добавляется.
 - Два одинаковых scan-а создают одну active issue; второй scan обновляет только
   `last_seen_at`. Resolution заполняет `resolved_at`, а последующий recurrence
   создаёт новую row. Ни один переход не создаёт user notification; track views
   показывают только текущее generic `has_problems`.
 - Purge raw/revision не блокируется `track_issues.subject_id`: это не FK и не durable
-  storage reference. Historical issue сохраняет UUID; новая issue с foreign или
-  отсутствующим subject отклоняется checker-ом под track lock.
+  storage reference. Historical issue сохраняет UUID, пока существует track; новая
+  issue с foreign или отсутствующим subject отклоняется checker-ом под track lock.
+  Physical purge track удаляет все active/resolved issue rows вместе с derived data,
+  не ставит `resolved_at` и не копирует codes/details/subject UUID в новый audit
+  event. Tombstone track UUID и существующий append-only audit остаются.
 - Concurrent detector/recheck одного track упорядочиваются lock на `tracks` row;
   transaction, которой также нужен owner, берёт locks только в порядке
   `user -> track`. Duplicate active identity дополнительно предотвращает partial
   unique index.
+- Full-lock activation linearize-ится commit-ом issue transaction. Direct
+  detail/download (`FOR SHARE`) и mutations (`FOR UPDATE`) повторно проверяют issues
+  под тем же track-row lock; pre-lock winner завершается до detector commit, а
+  post-commit operation видит block. Collection statement, начатый до commit, может
+  вернуть прежний result без per-row locking; in-flight responses не отменяются.
 - Stale result preliminary scan не применим: после track lock выполняется
   authoritative check. Его timeout/error оставляет issue неизменной; только
   successful in-transaction result создаёт/обновляет/resolve-ит row. Check имеет
@@ -911,10 +1289,24 @@ private draft → moderated immutable revision.
   stale control, изменённое manual value или reparse не могут переиспользовать
   acknowledgement для других comparison inputs.
 - Moderator видит acknowledged duration outlier и comparison inputs; наличие flag
-  само по себе не меняет moderation outcome или порядок очереди.
+  само по себе не меняет moderation outcome, `submitted_for_review_at` или FIFO
+  position.
 - Moderator не может исправить duration pending revision; после
   `changes_requested` авторский resubmit создаёт новый immutable snapshot, а прежний
   остаётся неизменным.
+- `changes_requested` сохраняет один correction code из закрытого DB CHECK и optional
+  owner-visible note; `other` требует note. Notification показывает localized label и
+  note, а removal/issue codes не переиспользуются.
+- Авторский resubmit хранит обязательный `correction_of_revision_id` на
+  непосредственно возвращённую same-track revision, сохраняет прежний
+  `base_revision_id` и по умолчанию показывает moderator-у correction diff вместе с
+  сохранёнными code/note. Total diff от baseline и полный snapshot остаются
+  вторичными views.
+- First-publication review показывает полный snapshot. Review изменения published
+  track по умолчанию показывает field diff и old/new geometry overlay относительно
+  сохранённого `base_revision_id`, позволяет открыть полный pending snapshot и не
+  допускает field-level approval. Stale baseline не approve-ится и не rebase-ится
+  автоматически.
 - Новый revision submit использует одноразовый standing CC BY 4.0 consent и не требует
   повторного acceptance.
 - Anonymous visitor без account/session может скачать только public sanitized GPX
@@ -936,12 +1328,172 @@ private draft → moderated immutable revision.
 - До approval owner/moderator не могут скачать private sanitized export и не
   получают presigned URL; object доступен только backend workers. После approval
   скачивание идёт исключительно через canonical current-revision route.
-- Pending/error export item виден moderator-у и допускает
-  `changes_requested`/reject, но не Approve. Manual retry не создаёт второй export
-  job; owner-facing status не раскрывает S3/queue failure.
-- После `changes_requested`/reject export становится discarded, private object
-  удаляется, а новый immutable resubmit создаёт собственный export. Late completion
-  не может вернуть discarded export в ready.
+- Pending/error export item отсутствует в обычной moderator queue; moderator не видит
+  infrastructure badge и retry action. Exhausted error доступен operator/admin, а
+  idempotent manual retry не создаёт второй export job. Owner-facing status не
+  раскрывает S3/queue failure.
+- Обычная moderation queue не хранит assignment/claim state. Любой moderator с
+  permission может открыть item; из конкурентных решений сохраняется только первое
+  committed вместе с actual actor, проигравший submit получает conflict и не создаёт
+  второй audit или notification.
+- Eligible revisions имеют immutable `submitted_for_review_at` и выдаются стабильным
+  FIFO `(submitted_for_review_at ASC, id ASC)` через keyset pagination. Duration
+  flags, resubmit и ручные действия не меняют порядок; priority/SLA schema нет.
+- Approve, `changes_requested` и moderator removal принимают ровно один revision ID
+  на request. Bulk controls/API/jobs отсутствуют; successful decision создаёт только
+  per-revision audit/notifications и возвращает обновлённую FIFO queue.
+- Approve и валидная `changes_requested` form выполняются без дополнительного modal;
+  double submit не обходит backend re-check. Moderator removal без отдельного
+  confirmation не выполняется.
+- На ordinary review screen removal визуально и структурно отделён от approve/
+  `changes_requested`; на full-lock containment screen approve/correction отсутствуют
+  и остаётся только confirmed removal.
+- Navigation away из undecided ordinary review оставляет item в исходном
+  `pending_review` и FIFO position без durable defer flag, audit или notification;
+  отдельного defer filter нет.
+- До outcome ordinary review не сохраняет moderator-authored comments/drafts и не
+  создаёт comment notification/unread state. Issue audit notes не отображаются как
+  moderation thread.
+- Ordinary moderation entrypoint показывает единственную FIFO list с keyset
+  navigation; filter/search/saved-view controls и per-filter counts отсутствуют.
+- Queue rows не содержат map/diff previews или decision buttons; opening review —
+  единственное действие, а все decision context загружается на review page.
+- Queue/review не обновляются realtime или polling-ом; stale page не может обойти
+  transaction re-check и после conflict заменяется свежей FIFO queue.
+- Race loser получает exact `409` error `moderation_item_already_decided`; response не
+  раскрывает победившее решение и не создаёт domain/audit/notification side effects.
+- Direct web link обработанного item не открывает historical review: moderator
+  получает `303` и neutral queue notice; audit history требует отдельную admin
+  permission.
+- Outcome approve, `changes_requested` или moderator removal нельзя undo, reopen,
+  edit или delete через ordinary moderation. Исправление представлено новой owner
+  revision, новым removal либо отдельным appeal/admin action; исходный decision и
+  reason/note остаются неизменными, а новый результат получает отдельный audit event.
+- Removal notification содержит production `TRAILBASE_SUPPORT_URL`, short track ID и
+  90-дневный deadline. Owner appeal form/record/status, attachments/thread и appeal
+  queue отсутствуют; после out-of-band support verification результат фиксируется
+  отдельной permissioned admin operation и append-only audit event.
+- Appeal management entrypoint имеет только одно exact lookup field по full track UUID
+  или short track ID. Списка/recent cases, queue, filters, fuzzy owner/name search и
+  saved cases нет. Unique exact match загружает sensitive context только после
+  permission/fresh-auth checks; collision short ID требует full UUID, а
+  unknown/ambiguous result нейтрален и не раскрывает context.
+- Short track ID имеет canonical display `trk-xxxx-xxxx-xxxx` из последних 12 lowercase
+  hex UUIDv7 track ID, без отдельной column/sequence и без UNIQUE assumption. Lookup
+  принимает normalized 12-hex reference либо canonical full UUID через non-unique
+  expression index; collision требует full UUID. 8-hex GPX filename suffix не
+  принимается как short lookup ID.
+- После unique lookup показывается только read-only removal summary: short/full ID,
+  lifecycle state, removal time, original reason code/note, purge deadline, immutable
+  decision snapshot, restore target и computed eligibility/blocking class. Отдельной
+  moderation workspace, live owner/provider identity, editable fields, support
+  payload/attachments, full audit timeline или persisted appeal case нет.
+- Summary содержит ровно один derived `action_state` из closed catalog
+  `decision_ready`, `restore_blocked_full_track_lock`,
+  `restore_blocked_export_unavailable`, `window_closed`, `not_current`,
+  `already_decided`. Deterministic precedence и button mapping применяются server-side;
+  payload не раскрывает issue details. UI не recompute-ит eligibility, а после
+  conflict загружает свежую summary; mutation повторяет computation под lock.
+- Admin appeal routes: `GET /admin/track-appeals` с optional `track_ref` query и
+  `POST /admin/track-appeals/:removal_decision_id/decision` с closed outcome/reason и
+  idempotency key. Обе outcome buttons используют один POST. HTML/htmx имеет full-page
+  fallback; active admin/fresh auth/CSRF и `no-store` обязательны. JSON/bot endpoints,
+  `/moderation/...` aliases и отдельные mutation routes для uphold/restore отсутствуют.
+- Fresh-auth expiry между form render и POST обрабатывается до sensitive reload и
+  mutation, вне `422/409/503`, без outcome/audit/outbox/notification. Re-auth сохраняет
+  server-side только allowlisted return target на canonical appeal GET с full UUID в
+  `track_ref`; submitted outcome/reason и прежний idempotency key не попадают в URL,
+  auth-flow или session. После re-auth summary/`action_state` recompute-ятся, form
+  получает новый key, а admin повторно выбирает outcome и reason.
+- Successful re-auth кладёт в active session только generic one-time flash
+  `appeal_form_discarded`, без identifiers/form data/key. Canonical GET атомарно
+  consume-ит flash и показывает coarse localized notice, что предыдущая отправка не
+  сохранена и decision нужно заполнить заново. Flash не находится в query или
+  `409/503` catalog и исчезает после одного render; terminal authoritative state
+  скрывает form независимо от notice.
+- Expired fresh auth ведёт в один top-level fresh-auth flow: full-page POST отвечает
+  `303` на server-generated start URL, htmx POST — `200`/`no-store` с пустым body и
+  `HX-Redirect` на тот же URL. Оба используют один server-side `return_to` на
+  canonical appeal GET; auth UI не рендерится fragment-ом. Invalid session/CSRF
+  остаются отдельными fail-closed ветками.
+- Appeal re-auth использует обычный bot-issued `web_session` token и существующий
+  `/auth` GET/POST. Consume rotate-ит current browser session, переносит исходный
+  `fresh_authenticated_at` из token record и возвращает по bound `return_to`; отдельной
+  appeal/re-auth credential state или consume route нет.
+- Server-rendered form содержит один 128-bit base64url `idempotency_key` для обеих
+  buttons. Committed outcome сохраняет только UNIQUE SHA-256 hash без raw key или
+  отдельной idempotency table/TTL. Same hash и exact normalized removal/outcome/reason
+  payload идемпотентны; payload mismatch получает `idempotency_key_reused`, новый key
+  после commit — `appeal_already_decided`. Key/hash не логируются и не заменяют CSRF.
+- Commit/idempotent retry выполняют PRG на canonical GET с full UUID: full-page POST
+  отвечает `303`, htmx navigates к тому же GET, отдельного success fragment нет.
+  Final `already_decided` summary показывает committed outcome и «Решение сохранено»;
+  browser refresh безопасен. Validation остаётся на form, conflict reload-ит summary.
+- Error matrix: `422` rerender-ит same form/values/key с field errors; `409` заменяет
+  stale form/key fresh authoritative summary и stable code; `503` сохраняет values/key
+  для manual retry и не заявляет, committed ли outcome. Automatic retry/polling нет;
+  `422/409` side-effect-free, uncertain COMMIT разрешается same-key retry. Htmx и
+  full-page semantics одинаковы, все responses `no-store` без internal details.
+- Closed appeal POST codes: `409` допускает только `appeal_already_decided`,
+  `appeal_window_closed`, `appeal_not_current`, `appeal_not_restorable` и
+  `idempotency_key_reused`, а `503` — только `appeal_temporarily_unavailable`.
+  `409` deterministically выбирает `already_decided`, `window_closed`, `not_current`,
+  recomputed restore-blocked/ready либо fresh same-case summary. `503` не утверждает
+  authoritative state/commit result. Template выбирается по status+code и не принимает
+  free-form backend/internal error details.
+- Admin appeal action принимает только `uphold_removal` или `restore_after_appeal`,
+  ссылку на исходный removal decision и обязательную admin reason. Оба outcome
+  добавляют audit event без изменения исходного removal; uphold не меняет lifecycle,
+  restore является отдельной state mutation. Generic/partial/custom outcome
+  отклоняется.
+- Без `track_appeal_decide` либо fresh auth admin appeal action не загружает sensitive
+  context и не создаёт outcome/audit/outbox. Permission mapped только к `admin`; через
+  moderator UI/endpoints или bot операция недоступна.
+- Заполненная appeal outcome+reason form завершается одним final submit без второго
+  modal/confirm screen. Перед submit видимы short track ID, current state, выбранный
+  outcome, его последствия и обязательная reason; используются только явно
+  разделённые «Подтвердить удаление» и «Восстановить трек», без generic «Сохранить».
+  Пока request выполняется, controls disabled; backend повторно проверяет permission,
+  fresh auth, single-shot и lifecycle invariants, retry не создаёт второй result.
+- Appeal reason принимает только `support_request_verified`,
+  `administrative_correction` или `other`; для `other` требуется validated audit-only
+  note 1–1000 code points. Unknown code, invalid/missing note отклоняются без outcome;
+  code/note не показываются owner-у и не логируются.
+- Appeal outcome имеет UNIQUE `removal_decision_id`. Same-key retry того же outcome
+  возвращает прежний результат без нового audit/outbox; второй либо competing outcome
+  получает exact `409` error `appeal_already_decided` и не меняет state. Reopen/second
+  appeal нет; correction выполняется отдельным append-only lifecycle action.
+- Restore прежнего published track использует тот же approved immutable snapshot без
+  новой moderation. Track без прежней approved revision становится private/editable и
+  требует нового owner resubmit. Ни одна already-decided removed revision повторно не
+  становится queue-eligible; её export остаётся discarded.
+- После moderator removal export прежнего approved current snapshot остаётся private
+  до uphold или 90-day purge, но canonical routes отвечают `404` и signed URL не
+  выдаются. Restore атомарно возвращает его в published без regeneration/restoring;
+  uphold/purge удаляют object. Это исключение не применяется к unapproved pending
+  export, который остаётся discarded и удаляется сразу.
+- `uphold_removal` сохраняет исходный purge deadline, `restore_after_appeal` ставит
+  `purge_at = NULL`; ни один outcome не продлевает и не перезапускает retention. Race с
+  purge worker сериализован track lock: purge-first блокирует restore, restore-first
+  отменяет eligibility worker-а.
+- Для первого нового appeal outcome общая eligibility требует current active removal,
+  отсутствующий outcome и `now() < purge_at`. После deadline или newer lifecycle state
+  недоступны обе операции независимо от lag purge worker-а; out-of-band case срок не
+  продлевает. До deadline full-track lock/unavailable retained export отключают только
+  restore, uphold остаётся доступным. Same-outcome idempotent retry committed result
+  продолжает работать.
+- `restore_after_appeal` succeeds только для current active removal до purge, без newer
+  lifecycle event/full lock и с ready retained export, когда восстанавливается
+  published snapshot. Иначе exact `409` error `appeal_not_restorable` не создаёт
+  outcome/audit/outbox/delete; temporary block можно устранить и повторить request.
+- Successful first appeal commit создаёт ровно одну locked-on notification/outbox:
+  uphold содержит fact/short ID/deadline, restore — published link либо private
+  edit/resubmit action. Internal admin context отсутствует; retry/conflict/failure не
+  создаёт duplicate, disabled owner следует общей moderation suppression.
+- После `changes_requested` или moderator removal pending revision export становится
+  discarded и private object удаляется. Новый immutable resubmit после
+  `changes_requested` создаёт собственный export; late completion не может вернуть
+  discarded export в ready.
 - `geometry_simplified_z11/13/15` populated для revision с tolerances 40/10/2 м.
 - GPX attachment в private chat без предварительного `/upload` после quota/slot
   checks создаёт upload flow и draft-track с распарсенными auto-derived. `/upload`
@@ -1026,6 +1578,10 @@ private draft → moderated immutable revision.
 
 **Acceptance**:
 - Карта показывает OSM-raster basemap.
+- Full-locked tracks отсутствуют в GeoJSON/sidebar/catalog results, а прямой detail
+  URL otherwise published track отвечает generic `503` с `Cache-Control: no-store`.
+- Уже закэшированный GeoJSON может сохранять track до 90 секунд согласно
+  `max-age=30, stale-while-revalidate=60`; lock не запускает cache purge.
 - z0–12 получает server-side POI clusters; z13/z14/z15 используют соответственно
   z11/z13/z15 simplified geometry.
 - На z16+ z15 остаётся context layer, а full geometry загружается только для
@@ -1112,6 +1668,7 @@ autodetect, moderated OSM import и deterministic cluster endpoint.
 
 **Acceptance**:
 - Free-text поиск по track name/description: tsvector + триграмы, опечатки 1-2 символа учитываются.
+- Full-locked tracks отсутствуют в search results и facet counts для любого principal.
 - Фильтр `activity=hike`, `difficulty=T3`, `season=winter`, `duration_min=3600 & duration_max=21600` (1-6h) — composable AND.
 - Комбинированный: текст + фасеты + bbox одновременно — один SQL-запрос через CTE.
 - POI-filter: `location_id=5` → список треков через локацию 5.

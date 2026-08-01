@@ -39,9 +39,12 @@ TrailBase — каталог треков. Требуется модель кл�
      Durable acknowledgement привязано к manual value, comparison source/value и
      algorithm version; оно переживает resume/takeover и инвалидируется при изменении
      этих inputs или reparse. Moderator видит comparison и acknowledgement как
-     informational flag без automatic reject или queue reprioritization и не меняет
-     duration напрямую: correction после `changes_requested` делает автор в новом
-     immutable revision.
+     informational flag без automatic moderation decision или изменения
+     `submitted_for_review_at`/FIFO position и не меняет duration напрямую:
+     correction после `changes_requested` делает автор в новом
+     immutable revision. Само решение использует один закрытый correction
+     `reason_code`; `classification_correction` покрывает activity/facet ошибки, а
+     optional owner-visible note содержит конкретные инструкции.
 3. **Auto-suggestion при загрузке** (предсказание рудиментарным классификатором на скорость+размах высот) — подсказка загрузчику; финальный выбор — человеком. Делается на профиле GPX, не server-side тяжёлым ML.
 4. **GPX export** не вводит отдельное versioned mapping activity/difficulty/tags в
    свободные `<trk><type>` или `<metadata><keywords>`; canonical classification

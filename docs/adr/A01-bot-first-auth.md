@@ -114,7 +114,8 @@ identity или recovery channels нет.
    пользователю и администраторам. In-flight parse может завершиться только private
    draft; `pending_review` deactivated owner сохраняет status, но исключается из
    moderator queue, а approve/publish re-check-ит active owner. Реактивация возвращает
-   pending item в очередь без отдельного `suspended` status. Deactivation и
+   pending item в очередь при `export_state = ready`, без отдельного `suspended`
+   status. Deactivation и
    approve/publish сериализуются owner row lock и lock order
    `user -> track -> revision`: approval-first остаётся public, deactivation-first
    блокирует публикацию. Linked disabled identity никогда не создаёт новый account:
@@ -134,7 +135,10 @@ identity или recovery channels нет.
    Identity и token flows вне private chat запрещены.
 3. **Web session опциональна.** Bot может выдать одноразовый deep-link
    `https://catalog/auth?token=...`; безопасный GET/POST flow создаёт server-side
-   session cookie только для web UI.
+   session cookie только для web UI. Browser re-auth переиспользует тот же
+   `web_session` token и `/auth` flow без отдельного credential или consume endpoint.
+   Token record и новая rotated session сохраняют исходный `fresh_authenticated_at`;
+   ordinary activity и sliding TTL не продлевают absolute 10-minute freshness.
 4. **Единый account с explicit provider linking.** Один `user_id`, к нему привязано не
    более одной `telegram:*` и одной `max:*` identity в `user_identities`.
    `/start <link-token>` второго provider после fresh authentication существующей
