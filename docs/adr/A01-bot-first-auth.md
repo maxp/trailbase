@@ -137,8 +137,138 @@ identity или recovery channels нет.
    `https://catalog/auth?token=...`; безопасный GET/POST flow создаёт server-side
    session cookie только для web UI. Browser re-auth переиспользует тот же
    `web_session` token и `/auth` flow без отдельного credential или consume endpoint.
+   Все token-bearing confirmation/success/invalid/expired/`503` responses используют
+   `Cache-Control: no-store`, `Referrer-Policy: no-referrer` и только same-origin static
+   assets. Caddy/app access/security logs пишут route без query/form body; raw
+   token/digest отсутствуют в errors, analytics и traces.
+   Initial token-query `GET /auth` не consume-ит token и всегда redirect-only. Valid
+   branch создаёт existing short-lived auth-flow record/cookie+nonce и отвечает `303`
+   на clean `/auth`. Malformed/unknown/expired/superseded branch получает `303` на
+   token-free `/auth` со stable non-secret `result=invalid`; target GET показывает
+   generic-invalid без lookup/изменения existing flow, plain `/auth` продолжает current
+   confirmation. Marker не добавляет state/cookie. Raw token отсутствует в
+   body/redirect/history; JavaScript, `history.replaceState`, client storage и новый
+   credential namespace не используются.
+   Auth-flow record, flow-cookie и form nonce разделяют exact original `web_session`
+   token deadline без нового interval или sliding от confirmation GET, retry/`503`.
+   Expired/missing component показывает generic-invalid page, idempotently очищает
+   remaining flow record/cookie и не consume-ит/recover-ит/reissue-ит source token.
+   Auth-flow record хранит только source token digest, allowlisted `return_to`, original
+   deadline и SHA-256 form-nonce hash. Independent 128-bit flow-cookie ID адресует
+   Valkey record по SHA-256 cookie value; raw source token после redirect не хранится.
+   Raw flow ID/nonce остаются только в `HttpOnly` cookie/hidden POST field, bindings
+   читаются из token record, raw/digest values отсутствуют в telemetry/DLQ.
+   Flow cookie имеет exact name `__Host-trailbase_auth_flow`, `Secure`, `HttpOnly`,
+   `SameSite=Lax`, `Path=/`, без `Domain`; `Max-Age`/`Expires` capped remaining source
+   deadline. Success, terminal invalid/expiry и explicit cancel очищают её
+   `Max-Age=0`; `__Host-trailbase_session` остаётся отдельной cookie.
+   Новый valid initial auth GET с existing flow-cookie атомарно удаляет previous record,
+   создаёт replacement и оставляет один active browser flow. Old tab/form получает
+   generic-invalid без side effects; previous source token остаётся unconsumed/unrevoked
+   и его link до deadline может снова заменить current flow.
+   Failed flow-cookie/form-nonce validation на `POST /auth` не consume-ит source token
+   и не удаляет valid flow. Missing/unknown cookie и nonce mismatch дают одну
+   generic-invalid response без token/pointer/session mutations. Unknown cookie
+   очищается у browser через `Max-Age=0`; valid record при wrong/stale nonce и current
+   cookie сохраняются. Общий `/auth` rate limit — 10/min на IP без отдельного
+   nonce-attempt counter.
+   Non-transient invalid `POST /auth` использует PRG: `303` на token-free `/auth` со
+   stable query marker `result=invalid`, затем generic-invalid GET без lookup current
+   flow. Cleanup следует принятому error class; wrong/stale nonce сохраняет valid
+   flow/cookie. Transient PostgreSQL/Valkey failure остаётся retryable `503` с
+   `Retry-After` без redirect, terminal marker или credential mutations и сохраняет
+   retryable flow/token/cookie.
+   После successful PostgreSQL active identity/account check одна atomic Valkey
+   function валидирует flow/nonce, source token и active pointer, создаёт либо
+   rotate-ит browser session, consume-ит token/pointer и удаляет flow. Все credential
+   mutations имеют одну linearization point; distributed PostgreSQL transaction нет.
+   Два concurrent POST одной form создают ровно одну session, а проигравший terminal
+   invalid и не revoke-ит успешную session.
    Token record и новая rotated session сохраняют исходный `fresh_authenticated_at`;
-   ordinary activity и sliding TTL не продлевают absolute 10-minute freshness.
+   ordinary activity и sliding TTL не продлевают absolute 10-minute freshness. Token
+   непосредственно выпускает explicit user-initiated «Подтвердить вход»
+   command/callback в private one-to-one chat, bound к
+   provider/user/chat/message/requester. Injected application UTC clock фиксирует
+   `fresh_authenticated_at` при server validation/acceptance event; provider-supplied
+   timestamp отбрасывается после payload validation, а event dedupe/binding
+   проверяются независимо. Этот validated event является единственным
+   confirmation; recent messages/notifications/background/browser activity, второй
+   prompt и PIN/password/TOTP freshness не создают.
+   Provider timestamp не сохраняется в `web_session` token/session auth records; там
+   остаются только server `fresh_authenticated_at` и opaque event/identity bindings
+   для dedupe/consume. В MVP timestamp не пишется также в operational events, logs или
+   metrics; observability ограничена server-time counters по provider/validation result
+   без raw provider payload. Delivery-delay signal требует отдельного будущего
+   retention contract.
+   Единственная fresh-auth metric —
+   `fresh_auth_confirmation_total{provider,result}`: `provider=telegram|max`,
+   `result=accepted|duplicate|invalid_event|invalid_binding|account_unavailable|internal_error`.
+   Identity/event/request/timestamp и дополнительные labels отсутствуют; HTTP/webhook
+   latency/status покрываются общими metrics.
+   `duplicate` означает exact provider replay только после committed acceptance:
+   provider получает `2xx`, но новый token/link/message/session state не создаётся.
+   Первый commit один раз выпускает link и increment-ит `accepted`; `internal_error` до
+   него остаётся retryable через общий worker/DLQ и duplicate не является.
+   Existing 7-day provider-event dedupe record содержит fresh-auth state
+   `processing|accepted`, без новой table/key namespace. Ingress атомарно claim-ит
+   processing вместе со Stream enqueue; replay этого state только получает `2xx`, пока
+   worker retry/DLQ продолжает original event. После token/link issuance worker ставит
+   accepted, replay которого increment-ит duplicate. Оба state имеют тот же TTL.
+   Worker одной atomic Lua/Valkey operation проверяет processing bindings, создаёт
+   единственный 128-bit 10-minute `web_session` token record и переводит state в
+   accepted до любого Bot API send. Crash не разделяет token/accepted, а delivery retry
+   переиспользует exact link; external network request не входит в commit.
+   При новом confirmation той же provider identity эта issuance атомарно заменяет
+   per-identity active-token pointer, удаляет previous token record и его ещё
+   существующий raw delivery field. Previous provider-event marker остаётся accepted;
+   отдельные bot message, revoke audit и notification не создаются.
+   Гонку `/auth` consume old link и new issuance линейризуют atomic Valkey operations
+   над pointer. Consume-first удаляет matching token record/pointer и может завершить
+   auth; issuance-first заменяет pointer и делает old link terminal invalid. Поздняя
+   issuance не отзывает создаваемую/созданную browser session; distributed transaction
+   с PostgreSQL отсутствует.
+   Active-token pointer хранится отдельным non-secret Valkey key по internal identity
+   UUID, содержит только SHA-256 token digest и получает `PEXPIREAT` exact token
+   deadline. Atomic consume удаляет его с token record, replacement заменяет;
+   missing/expired pointer или target terminal invalid и очищается idempotently.
+   Delivery data, sliding TTL и janitor отсутствуют.
+   `web_session` token record адресуется только по `SHA-256(raw_token)`, тому же digest,
+   что pointer, без raw token в record/key. При 128-bit CSPRNG entropy используется
+   unsalted SHA-256 без custom HMAC/salt. Raw token остаётся лишь в link/browser
+   request и short-lived delivery field; raw value и digest запрещены в
+   logs/metrics/traces/DLQ.
+   Raw link token для crash-safe retry хранится только как short-lived delivery field
+   existing accepted dedupe record до successful send или token expiry. Field удаляется
+   после delivery/expiry; seven-day marker остаётся non-secret. Raw token не попадает в
+   logs/metrics/traces/DLQ; отдельного namespace, deterministic derivation и re-issuance
+   нет.
+   Runtime требует Valkey 9.x minimum: atomic issuance задаёт delivery field
+   `HPEXPIREAT` на exact token deadline, successful send выполняет idempotent `HDEL`.
+   Seven-day accepted key TTL не меняется; janitor и отдельный TTL key отсутствуют.
+   Если successful Bot API delivery не завершилась до token/delivery-field expiry,
+   worker прекращает её terminally без stale send, re-issuance, изменения accepted
+   marker или отдельного user notification. Exact replay остаётся `duplicate`; только
+   новое explicit «Подтвердить вход» action создаёт новый provider event, freshness,
+   token и link. Failure отражается только общими Bot API delivery metrics/alert без
+   raw token.
+   Post-issuance delivery делает максимум пять total attempts с exponential
+   backoff/jitter. Retry разрешён только для timeout/network errors, `429` и `5xx` и
+   только если следующая attempt с `Retry-After` укладывается в original token
+   deadline. Остальные `4xx`, exhausted budget и retry за deadline terminal сразу:
+   idempotent `HDEL`, accepted marker сохраняется, DLQ/late replay отсутствуют.
+   Pre-issuance `internal_error` остаётся в общем worker retry/DLQ flow.
+   Любая active linked Telegram/Max
+   identity может выполнить re-auth: primary является delivery preference, а не более
+   сильной identity. Token bound к exact internal identity/provider/user/event;
+   consume re-check-ит active membership, terminally отклоняет unlinked/foreign token
+   и после success создаёт account-level freshness независимо от provider. При valid
+   current browser session того же user rotation является credential refresh:
+   token/CSRF/freshness заменяются, old current session revoke-ится, other sessions не
+   меняются и `new_session` notification не создаётся. Без valid same-user session
+   successful `/auth` является ordinary new login с locked-on notification.
+   Same-browser record сохраняет original `created_at`, обновляет token hash/CSRF,
+   bot-derived freshness, current `last_seen_at`, safe short User-Agent и one-year TTL;
+   отдельного `reauthenticated_at` нет.
 4. **Единый account с explicit provider linking.** Один `user_id`, к нему привязано не
    более одной `telegram:*` и одной `max:*` identity в `user_identities`.
    `/start <link-token>` второго provider после fresh authentication существующей

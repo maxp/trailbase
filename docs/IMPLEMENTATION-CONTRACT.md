@@ -15,7 +15,8 @@
 
 - Dev и первый production используют один Docker Compose contract.
 - Production stack: Caddy, `web`, `bot-worker`, `parse-worker`, one-shot `migrate`,
-  PostgreSQL/PostGIS, Valkey и MinIO.
+  PostgreSQL/PostGIS, Valkey 9.x или новее и MinIO. Valkey 9.0 — минимальная версия:
+  auth delivery state использует hash-field expiration commands.
 - `web`, `bot-worker`, `parse-worker` и `migrate` собираются из одного application
   image, но запускаются разными командами.
 - В dev доступен optional profile `webhook-dev` со stable-hostname Cloudflare Tunnel.
@@ -213,6 +214,29 @@
   проходит обычный retry/DLQ. После восстановления PostgreSQL исходный token можно
   использовать повторно, только если он всё ещё действителен.
 - Для каждой provider identity действительна только последняя web-session ссылка.
+  Atomic issuance нового `web_session` token заменяет per-identity active-token
+  pointer, удаляет previous token record и очищает его raw delivery field, если оно ещё
+  существует. Previous provider-event dedupe record сохраняет accepted marker; новые
+  bot messages, отдельный revoke audit и notification не создаются.
+- Гонка `/auth` consume previous link и новой issuance линейризуется их atomic Valkey
+  operations. Consume проверяет совпадение active-token pointer с предъявленным token
+  и одной operation удаляет token record и pointer. Если consume linearize-ился
+  первым, auth flow может завершиться, а более поздняя issuance не отзывает уже
+  созданную или создаваемую browser session. Если первой linearize-илась issuance,
+  previous link terminal invalid. Distributed transaction между Valkey и PostgreSQL
+  для этой гонки отсутствует.
+- Active-token pointer хранится отдельным non-secret Valkey key, scoped к internal
+  identity UUID, и содержит только SHA-256 token digest. Issuance ставит pointer и
+  `PEXPIREAT` ровно на absolute token deadline в той же atomic operation; consume
+  удаляет его вместе с token record, replacement заменяет. Missing/expired pointer или
+  missing target делает token terminal invalid и очищается idempotently. Pointer —
+  token index, не delivery storage; sliding TTL и janitor отсутствуют.
+- `web_session` token record адресуется только по `SHA-256(raw_token)` — тому же digest,
+  который хранит active-token pointer. Raw token отсутствует в record и Valkey key;
+  unsalted SHA-256 достаточен при 128-bit CSPRNG entropy, custom HMAC/salt scheme не
+  вводится. Raw token существует только в user-facing link/browser request и
+  short-lived delivery field. Ни raw token, ни digest не попадают в logs, metrics,
+  traces или DLQ.
 - `web_session` и `link_identity` — разные token namespaces/purposes. Link token
   содержит `target_user_id` и ожидаемый candidate provider, но не candidate
   `provider_user_id`.
@@ -221,6 +245,111 @@
   record сохраняет исходный `fresh_authenticated_at`. Тот же `/auth` GET/POST flow
   атомарно consume-ит token, создаёт новую browser session и использует bound
   `return_to`; отдельные re-auth token/table/cookie/consume endpoint отсутствуют.
+- Fresh bot authentication для выпуска `web_session` link — только explicit
+  user-initiated action «Подтвердить вход» в private one-to-one chat. Validated
+  command/callback bound к provider/user/chat/message/requester сразу выпускает link,
+  а `fresh_authenticated_at` фиксируется injected application UTC clock в момент,
+  когда server валидировал и принял исходный webhook event. Provider-supplied event
+  timestamp не участвует в freshness и отбрасывается после validation входного
+  payload; provider event dedupe/binding остаются отдельными обязательными checks.
+  Обычное недавнее сообщение, notification click, background event или existing
+  browser session не создают freshness. Дополнительные PIN/password/TOTP и вторая
+  confirmation-кнопка отсутствуют.
+- Provider-supplied event timestamp не сохраняется в `web_session` token record или
+  browser session. Auth state содержит только server `fresh_authenticated_at` и уже
+  принятые opaque provider event/identity bindings, необходимые для dedupe и consume
+  validation. В MVP этот timestamp также не пишется в operational events, logs или
+  metrics; observability ограничена server-time counters по provider и validation
+  result без raw provider payload и отдельной retention policy.
+- Единственная special-purpose fresh-auth metric — counter
+  `fresh_auth_confirmation_total{provider,result}`. Label `provider` закрыт значениями
+  `telegram|max`, `result` —
+  `accepted|duplicate|invalid_event|invalid_binding|account_unavailable|internal_error`.
+  User/chat/event/request identifiers, timestamps, routes, error details и иные labels
+  отсутствуют; latency/status покрывают общие HTTP/webhook metrics.
+- Fresh-auth `duplicate` означает только повтор exact provider event, для которого
+  action-level acceptance уже committed. Provider получает success/`2xx`, но новый
+  token/link не выпускается, bot message не редактируется и не отправляется, session/
+  auth state не меняется; increment-ится только `duplicate`. Первый committed
+  acceptance один раз выпускает link и increment-ит `accepted`. `internal_error` до
+  commit не становится `duplicate` и продолжает общий worker retry/DLQ flow.
+- Для fresh-auth существующая 7-day provider-event dedupe record имеет только state
+  `processing|accepted`; отдельной table или второго key namespace нет. Ingress одной
+  атомарной Valkey operation создаёт `processing` и enqueue-ит event. Replay при
+  `processing` получает `2xx` через общую webhook dedupe без fresh-auth result
+  increment или side effects; исходный event продолжает worker retry/DLQ. После
+  выпуска token/link worker переводит record в `accepted`; replay этого state
+  increment-ит `duplicate`. Оба state используют исходный seven-day TTL.
+- Worker генерирует ровно один 128-bit `web_session` token и одной atomic Lua/Valkey
+  operation проверяет processing event/owner bindings, создаёт его 10-minute token
+  record и переводит dedupe state `processing -> accepted`. Operation выполняется до
+  любого Bot API request; crash не оставляет accepted без usable token или live token
+  при processing. External delivery не входит в atomic boundary и при retry обязана
+  использовать тот же link, не выпуская новый credential.
+- Та же atomic issuance заменяет per-identity active-token pointer. Если previous
+  `web_session` token ещё не истёк, operation удаляет его token record и raw delivery
+  field в прежней accepted dedupe record, но не меняет сам accepted marker. Новое bot
+  message сверх обычной доставки нового link, revoke audit и notification для этой
+  замены отсутствуют.
+- `/auth` consume и issuance используют active-token pointer как общий linearization
+  point. Consume-first атомарно проверяет pointer и удаляет token record/pointer, после
+  чего может завершить auth даже при более поздней issuance; issuance-first заменяет
+  pointer и делает previous link terminal invalid. Более поздняя issuance не отзывает
+  уже созданную/создаваемую browser session; cross-store distributed transaction нет.
+- Pointer является отдельным non-secret per-identity Valkey key только с SHA-256 token
+  digest. Atomic issuance задаёт ему `PEXPIREAT` на тот же absolute token deadline,
+  consume удаляет с token record, replacement заменяет. Missing/expired pointer или
+  missing target terminal invalid и очищаются idempotently; raw token, sliding TTL,
+  janitor и delivery data в pointer отсутствуют.
+- `web_session` record lookup key — только `SHA-256(raw_token)`, совпадающий с pointer
+  digest; raw token в record/key отсутствует. При 128-bit CSPRNG entropy используется
+  unsalted SHA-256 без custom HMAC/salt. Raw value остаётся лишь в link/browser request
+  и short-lived delivery field; raw token и digest запрещены в logs/metrics/traces/DLQ.
+- Для crash-safe delivery retry raw link token хранится только как short-lived delivery
+  field той же accepted dedupe record. Field доступно не дольше token expiry
+  (`fresh_authenticated_at + 10 minutes`), не попадает в logs, metrics, traces или DLQ
+  payload и атомарно удаляется после successful Bot API delivery. После delivery/expiry
+  seven-day record сохраняет только non-secret accepted outcome/event/identity
+  bindings для replay classification. Deterministic/custom token derivation, второй
+  delivery namespace и повторная выдача token отсутствуют.
+- Minimum runtime Valkey 9.x. Worker atomic script задаёт delivery field absolute
+  expiry через `HPEXPIREAT` ровно на token deadline; successful Bot API send выполняет
+  idempotent `HDEL`. После logical field expiry `HGET` не возвращает raw token, тогда
+  как key-level TTL non-secret accepted marker остаётся seven days. Janitor, polling и
+  отдельный TTL key отсутствуют.
+- Если successful Bot API delivery не завершилась до token/delivery-field expiry,
+  worker прекращает delivery terminally: stale link не отправляется, token не
+  перевыпускается, accepted record не меняется и отдельное user notification не
+  создаётся. Exact replay исходного provider event остаётся `duplicate`; только новое
+  explicit «Подтвердить вход» action создаёт новый provider event, freshness, token и
+  link. Failure отражается только в общих Bot API delivery metrics/alert без raw token.
+- Post-issuance fresh-auth Bot API delivery выполняет максимум пять total attempts с
+  exponential backoff и jitter. Retry разрешён только для timeout/network errors,
+  `429` и `5xx`; `Retry-After` соблюдается, только если следующая attempt укладывается
+  в исходный token deadline. Остальные `4xx`, исчерпание пяти attempts и невозможность
+  уложить следующую attempt в deadline terminal сразу: worker делает idempotent
+  `HDEL` raw delivery field, сохраняет accepted marker и не создаёт DLQ/late replay.
+  Pre-issuance `internal_error` по-прежнему проходит общий worker retry/DLQ flow.
+- Re-auth link можно выпустить через любую active linked Telegram/Max identity, не
+  только через primary provider: primary управляет delivery, но не trust level.
+  Token record bound к exact internal identity UUID, provider, user и issuance event.
+  Перед session rotation `/auth` повторно проверяет в PostgreSQL, что identity всё ещё
+  active и принадлежит тому же active account. Unlinked/foreign identity делает token
+  terminal invalid без fallback на primary; successful consume создаёт account-level
+  freshness без provider restriction для новой session.
+- Если `POST /auth` одновременно видит valid current browser session того же `user_id`,
+  re-auth rotation считается credential refresh той же browser/device continuity, а
+  не новым login. Она выдаёт новые session token и CSRF state, переносит новый
+  `fresh_authenticated_at`, отзывает прежнюю current session и не меняет другие
+  sessions, но не создаёт web-inbox/primary-bot `new_session` notification. Если
+  current session отсутствует, invalid либо принадлежит другому user, successful
+  `/auth` остаётся обычным new login и создаёт принятое locked-on security notification.
+- Same-browser rotated session наследует original `created_at`, получает новый session
+  token hash и CSRF state, `fresh_authenticated_at` из web-session token record,
+  `last_seen_at` равный времени successful `POST /auth` и заново вычисленный safe short
+  User-Agent summary текущего request. Новый Valkey key получает стандартный one-year
+  sliding TTL от rotation time. Отдельное `reauthenticated_at` не хранится; без valid
+  same-user current session ordinary new session получает новый `created_at`.
 - Link flow инициируется из authenticated account context. До выдачи link token
   требуется fresh bot authentication не старше 10 минут через уже привязанную
   identity; browser request дополнительно требует session-bound CSRF.
@@ -236,10 +365,63 @@
   identity и не fallback-ит на обычный `/start`. Ответ не раскрывает причину или target
   account и предлагает получить новую ссылку либо отдельно отправить plain `/start`
   без payload для создания собственного account.
-- `GET /auth?token=...` для web-session token не расходует token: preview/scanner не
-  должен сжечь вход.
-- GET создаёт короткую auth-flow запись в Valkey и выдаёт `HttpOnly`, `Secure`,
-  `SameSite=Lax` flow-cookie плюс одноразовый form nonce.
+- Initial `GET /auth` с query parameter `token` всегда redirect-only и не расходует
+  web-session token: preview/scanner не должен сжечь вход. Для valid token GET создаёт
+  существующую short-lived auth-flow запись в Valkey, выдаёт
+  `__Host-trailbase_auth_flow` cookie с одноразовым form nonce и отвечает
+  `303 See Other` на чистый `GET /auth`. Malformed/unknown/expired/superseded token
+  получает `303` на token-free `GET /auth` со stable non-secret `result=invalid`
+  marker. Target GET не lookup-ит и не меняет existing flow-cookie/record, показывает
+  одинаковую generic-invalid page без reason/identifier; plain `/auth` без marker
+  продолжает existing confirmation. Marker не добавляет server-side state/cookie.
+  Initial response не рендерит body, raw token отсутствует в redirect target и
+  обычной browser history. JavaScript, `history.replaceState`, local/session storage и
+  новый credential namespace не используются.
+- Auth-flow record, flow-cookie и form nonce имеют один absolute expiry, равный
+  original `web_session` token deadline. Initial redirect не выдаёт новый ten-minute
+  interval; confirmation GET, retry и `503` не продлевают срок. Expired/missing любой
+  component показывает ту же generic-invalid page, idempotently удаляет оставшиеся
+  flow record/cookie и не consume-ит, не восстанавливает и не перевыпускает source
+  token. Sliding expiry отсутствует.
+- Auth-flow record хранит только source `web_session` token digest, allowlisted
+  `return_to`, original deadline и SHA-256 form-nonce hash. Flow-cookie — независимый
+  128-bit CSPRNG opaque ID; Valkey lookup key строится из SHA-256 cookie value. После
+  initial redirect raw source token не хранится. Raw flow ID остаётся только в
+  `HttpOnly` cookie, raw nonce — только в hidden POST field; provider/user bindings
+  читаются из source token record. Raw flow ID, nonce и их digests отсутствуют в logs,
+  metrics, traces и DLQ.
+- Flow-cookie contract: exact name `__Host-trailbase_auth_flow`, `Secure`, `HttpOnly`,
+  `SameSite=Lax`, `Path=/`, без `Domain`. `Max-Age`/`Expires` не превышают remaining
+  source-token deadline. Cookie очищается через `Max-Age=0` после success, terminal
+  invalid/expiry или explicit cancel и остаётся отдельной от
+  `__Host-trailbase_session`.
+- Новый valid initial auth GET при existing flow-cookie одной atomic Valkey operation
+  удаляет previous flow record, создаёт новую и заменяет cookie: на browser остаётся
+  ровно один active auth-flow. Previous tab/form получает generic-invalid без side
+  effects. Её source token не consume-ится и не revoke-ится; исходную link можно снова
+  открыть до deadline, что, в свою очередь, заменит текущий browser flow.
+- Failed flow-cookie/form-nonce validation на `POST /auth` никогда не consume-ит source
+  token и не удаляет valid flow. Missing/unknown cookie и nonce mismatch дают одну
+  generic-invalid response без token/pointer/session mutations. Unknown cookie
+  очищается у browser через `Max-Age=0`; если cookie адресует valid record, wrong или
+  stale nonce сохраняет record и не очищает и не заменяет cookie, поэтому old tab не
+  может сбросить current valid form. Действует общий `/auth` rate limit 10 запросов в
+  минуту на IP; отдельного nonce-attempt counter нет.
+- Все non-transient invalid `POST /auth` используют Post/Redirect/Get: POST не рендерит
+  body и отвечает `303` на token-free `/auth` со stable non-secret query marker
+  `result=invalid`; target GET показывает generic-invalid без lookup или изменения
+  current flow. Cleanup выполняется до redirect только по принятому классу ошибки:
+  wrong/stale nonce для valid record сохраняет flow/cookie. Transient PostgreSQL или
+  Valkey failure остаётся retryable `503` с `Retry-After` без redirect, terminal marker
+  и token/flow/session mutations; retryable flow, token и cookie сохраняются.
+- После successful PostgreSQL active identity/account check `POST /auth` имеет одну
+  Valkey linearization point. Одна atomic function валидирует flow/nonce, source token
+  record и active-token pointer, создаёт новую либо same-browser rotated session,
+  consume-ит source token и pointer и удаляет flow record; все credential mutations
+  выполняются вместе либо не выполняются. Distributed transaction с PostgreSQL нет, а
+  failure его предварительной проверки возвращает принятый mutation-free `503`. Из
+  двух concurrent POST одной form ровно один создаёт session; проигравший получает
+  consumed terminal invalid и не revoke-ит успешную session.
 - `POST /auth` проверяет cookie/nonce, расходует token, создаёт только browser session
   и делает redirect на чистый URL. Если browser уже authenticated, новая session
   rotate-ит и отзывает прежнюю session этого браузера. Session получает
@@ -249,9 +431,12 @@
   provider ID.
 - `return_to` допускает только внутренний путь, начинающийся с одного `/`; absolute URL
   и `//host` отклоняются. Нормализованный путь хранится server-side в auth-flow записи.
-- Auth pages используют `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, не
-  подключают сторонние ресурсы. Значение query parameter `token` удаляется из access и
-  application logs.
+- Все token-bearing `GET /auth` и `POST /auth` responses — confirmation, success,
+  invalid/expired и `503` — используют `Cache-Control: no-store` и
+  `Referrer-Policy: no-referrer`; auth pages подключают только same-origin static assets
+  без third-party resources. Caddy/application access и security logs пишут route без
+  query и никогда не пишут form body. Raw token и digest отсутствуют в error details,
+  analytics и tracing attributes.
 - Web-session/link tokens имеют 128 бит криптографической энтропии: 16 random bytes,
   Base64URL без padding.
 
@@ -269,7 +454,8 @@
   сокращённый `User-Agent` и CSRF state. `fresh_authenticated_at` не меняется от
   обычных requests, `last_seen_at` или sliding TTL; sensitive web operation допускает
   его только до absolute `fresh_authenticated_at + 10 minutes`. IP в session/profile
-  не сохраняется.
+  не сохраняется. `reauthenticated_at` отсутствует: при credential rotation original
+  `created_at` сохраняется, а факт/время re-auth уже задаёт `fresh_authenticated_at`.
 - Карточка active web session в private chat показывает только безопасное сокращённое
   device/browser description, `created_at`, `last_seen_at`, текущее sliding
   `expires_at` и действие «Завершить». IP, geolocation, полный User-Agent, session ID
@@ -314,6 +500,9 @@
 
 - Fresh bot authentication не старше 10 минут требуется перед unlink identity, сменой
   primary bot provider, logout-all, назначением ролей и деактивацией.
+- Там, где fresh bot authentication выпускает web-session link, она использует
+  описанное explicit private-chat действие «Подтвердить вход»; сам validated event
+  является единственным confirmation и не дополняется вторым prompt или credential.
 - Draft takeover не относится к sensitive operations и не требует fresh bot auth:
   достаточно authenticated owner и явного подтверждения. Web request требует active
   session и CSRF, bot request — validated identity в private chat.
@@ -487,6 +676,48 @@
   последовательно, разных identities — параллельно.
 - Dedup provider event ID хранится семь дней. Business operations дополнительно
   идемпотентны в PostgreSQL.
+- Для explicit fresh-auth confirmation эта же dedupe record содержит
+  `processing|accepted`: claim `processing` и Stream enqueue атомарны. Processing
+  replay только acknowledge-ится; accepted replay increment-ит специальный
+  `duplicate`. Новый namespace/table и отдельный TTL отсутствуют.
+- Worker atomic Lua/Valkey operation одновременно создаёт единственный 10-minute
+  `web_session` token record и меняет processing на accepted до Bot API send. Delivery
+  retry использует тот же link; внешний network call не является частью commit.
+- При issuance нового token для той же provider identity эта operation также заменяет
+  active-token pointer, удаляет previous token record и его ещё существующий raw
+  delivery field. Previous accepted marker сохраняется; отдельные bot message, revoke
+  audit и notification не создаются.
+- Гонку previous-link consume/new issuance разрешает порядок atomic Valkey operations:
+  consume-first удаляет matching token record/pointer и может завершить auth;
+  issuance-first заменяет pointer и terminally отклоняет old link. Поздняя issuance не
+  отзывает создаваемую/созданную session; distributed Valkey/PostgreSQL transaction не
+  вводится.
+- Active-token pointer — отдельный non-secret Valkey key по internal identity UUID,
+  содержащий только SHA-256 token digest. Он получает `PEXPIREAT` exact token deadline
+  при issuance и удаляется/заменяется atomic consume/replacement. Missing pointer или
+  target terminal invalid и idempotently очищается; sliding TTL/janitor отсутствуют.
+- Token record адресуется тем же `SHA-256(raw_token)`, что pointer, и не хранит raw
+  value в record/key. 128-bit CSPRNG token использует unsalted SHA-256 без custom
+  HMAC/salt. Raw token допустим только в link/browser request и short-lived delivery
+  field; raw и digest отсутствуют в logs/metrics/traces/DLQ.
+- Exact raw link для retry находится только в short-lived delivery field accepted
+  dedupe record до successful send или token expiry; затем field удаляется, а
+  non-secret accepted marker остаётся до общего seven-day TTL. Secret не попадает в
+  logs/metrics/traces/DLQ; отдельного delivery namespace нет.
+- Valkey 9.x является minimum. Atomic issuance задаёт field-level absolute expiry
+  `HPEXPIREAT` на token deadline, successful delivery делает idempotent `HDEL`; marker
+  продолжает key-level seven-day TTL без janitor или отдельного expiry key.
+- Не доставленный до token/delivery-field expiry fresh-auth link завершается terminally
+  без stale send, re-issuance, изменения accepted marker или отдельного user
+  notification. Existing event replay остаётся duplicate; новый credential возможен
+  только после нового explicit «Подтвердить вход» provider event. Failure виден только
+  в общих Bot API delivery metrics/alert без raw token.
+- Для post-issuance delivery действует максимум пять total attempts с exponential
+  backoff/jitter. Retry допускается только для timeout/network, `429` и `5xx`, причём
+  `Retry-After` и следующая attempt должны помещаться в исходный token deadline.
+  Остальные `4xx`, exhausted budget или невозможность уложить retry terminal сразу с
+  idempotent `HDEL`, сохранением accepted marker и без DLQ/late replay. Это исключение
+  из следующего общего правила; pre-issuance `internal_error` использует общий flow.
 - Transient failure: пять попыток с exponential backoff, затем dead-letter stream.
   Replay DLQ выполняется отдельной admin/CLI operation.
 - Недоступность PostgreSQL во время account-specific bot operation считается
@@ -588,9 +819,11 @@
   уведомляется через прежний и новый primary providers. Ошибка любой bot delivery не
   откатывает подтверждённую смену.
 - Новая session создаёт уведомление со временем, provider и сокращённым описанием
-  устройства, но без IP. Sliding TTL refresh существующей session уведомление не
-  создаёт. Уведомление содержит deep-link только в authenticated UI управления
-  active sessions; ссылка сама не выполняет revoke и не содержит action token.
+  устройства, но без IP. Sliding TTL refresh существующей session и same-browser
+  re-auth rotation при valid current session того же user уведомление не создают.
+  Re-auth без такой current session является новым login и уведомляется. Уведомление
+  содержит deep-link только в authenticated UI управления active sessions; ссылка сама
+  не выполняет revoke и не содержит action token.
 - При unlink identity событие отправляется всем оставшимся providers и best-effort
   отвязываемому provider; web inbox сохраняется всегда. Transaction записывает в
   outbox зашифрованный snapshot delivery target для detached identity до её физического
@@ -612,6 +845,13 @@
 - `/metrics` Prometheus-compatible и внутренний. Минимальный набор: HTTP/DB/Valkey
   latency, statuses, stream lag/pending, retries, DLQ size, auth success/failure,
   rate-limit rejects.
+- Fresh bot confirmation имеет ровно один дополнительный low-cardinality counter
+  `fresh_auth_confirmation_total{provider,result}` с `provider=telegram|max` и
+  `result=accepted|duplicate|invalid_event|invalid_binding|account_unavailable|internal_error`.
+  Identity/request/event IDs, timestamp, route и error-detail labels запрещены.
+- Его `duplicate` increment допустим только после committed fresh-auth acceptance;
+  exact replay получает `2xx` без token/link/message/session side effects. До commit
+  `internal_error` остаётся retryable через общий worker retry/DLQ, не duplicate.
 - Все logs — structured JSON в stdout/stderr через Telemere. Контейнеры не ведут
   собственные log files.
 - Сквозной correlation/request ID — UUIDv7. Он передаётся через webhook, stream,
@@ -1443,6 +1683,22 @@
   существующий `/auth` GET/POST flow. Successful consume rotate-ит current browser
   session, переносит исходный `fresh_authenticated_at` из token record и возвращает по
   bound `return_to`; отдельного appeal/re-auth credential или consume route нет.
+- Link для этой ветки выпускается непосредственно explicit private-chat action
+  «Подтвердить вход». Только bound validated command/callback создаёт freshness;
+  недавние сообщения, notifications, background events и browser activity её не
+  создают, дополнительного PIN или второго confirmation нет.
+- Admin может выполнить это действие через любую active linked Telegram/Max identity.
+  Token bound к exact identity/provider/user/event, consume повторно проверяет active
+  membership; unlinked/foreign token terminal invalid, а successful freshness
+  становится account-level. Primary provider не получает отдельной auth роли.
+- Same-browser consume при valid current session того же user является credential
+  refresh и не создаёт `new_session` notification; новые token/CSRF/freshness заменяют
+  current session, остальные sessions не затрагиваются. Без same-user current session
+  successful `/auth` остаётся обычным new login с locked-on security notification.
+- При таком refresh session сохраняет original `created_at`, получает new token/CSRF,
+  bot-derived freshness, current `last_seen_at`/safe User-Agent summary и новый
+  one-year sliding TTL. Отдельного `reauthenticated_at` нет; ordinary new login создаёт
+  новый `created_at`.
 - При render actionable form server генерирует 128-bit CSPRNG base64url
   `idempotency_key`; обе outcome buttons отправляют одно hidden field, отдельное от
   session-bound CSRF. Committed outcome хранит только
@@ -1502,6 +1758,40 @@
   отсутствует. Controls disabled in-flight, а backend перед commit повторно проверяет
   permission, fresh auth, single-shot и lifecycle invariants. Retry следует общей
   idempotency semantics appeal outcome.
+- Appeal form не показывает live fresh-auth countdown или exact expiry timestamp.
+  Рядом с decision controls есть только localized static hint «Подтверждение входа
+  действует 10 минут; если оно истечёт, потребуется подтвердить вход снова».
+  JavaScript timer, polling, auto-refresh и auto-submit отсутствуют; client clock не
+  участвует в authorization. Authoritative freshness проверяется backend-ом при POST,
+  а expiry использует принятые discard/re-auth/fresh-summary/one-time-notice ветки.
+- Actionable render и Decision POST используют один server-side predicate
+  `now < fresh_authenticated_at + 10 minutes` без UX safety buffer или второго
+  threshold. При равенстве deadline и после него fresh auth считается expired. GET не
+  показывает form, который POST уже заведомо отклонит по иному freshness margin; если
+  deadline проходит во время заполнения, POST использует обычный discard/re-auth flow.
+- Decision POST фиксирует один server `authorization_now` при authoritative mutation
+  guard внутри transaction, непосредственно перед authoritative preconditions и
+  первой mutation. Если в этой точке `authorization_now < fresh_authenticated_at + 10
+  minutes`, operation атомарно завершается даже при physical commit после deadline;
+  повторной wall-clock проверки на commit boundary нет. Queue/lock latency после
+  успешного guard не превращает уже авторизованную operation в fresh-auth expiry.
+- Appeal GET и POST получают `now` из одного injected application-level UTC clock с
+  `java.time.Instant` semantics. Client clock и PostgreSQL `now()` в freshness
+  authorization не участвуют; отдельного DB round trip ради времени нет. Все app
+  instances обязаны иметь синхронизированные UTC system clocks, а DB-managed
+  timestamps могут использовать PostgreSQL clock, не становясь вторым freshness
+  authority.
+- Исходный `fresh_authenticated_at` для appeal re-auth фиксируется тем же application
+  clock при server-side validation/acceptance explicit bot webhook/callback. Timestamp
+  provider-а не влияет на начало или длительность freshness и отбрасывается после
+  validation входного payload; dedupe и exact event/identity bindings проверяются
+  независимо от времени.
+- `web_session` token/session auth records для appeal не содержат provider timestamp:
+  только server `fresh_authenticated_at` и opaque event/identity bindings для уже
+  принятой dedupe/consume validation. В MVP timestamp не создаёт также redacted
+  operational event и не попадает в logs/metrics; остаются только server-time counters
+  по provider/validation result. Измерение delivery delay можно добавить отдельным
+  будущим контрактом, не меняя auth state.
 - Appeal outcome переиспользует internal reason contract account reactivation:
   `reason_code text NOT NULL` с DB CHECK на `support_request_verified`,
   `administrative_correction`, `other`, без PostgreSQL enum. Optional

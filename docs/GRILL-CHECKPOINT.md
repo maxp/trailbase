@@ -9,22 +9,21 @@
 
 ## Последнее подтверждённое решение
 
-Browser re-auth переиспользует обычный bot-issued `web_session` token и существующий
-`/auth` GET/POST flow без отдельного re-auth credential/table/cookie/consume endpoint.
-Token выдаётся после fresh bot authentication и хранит исходный
-`fresh_authenticated_at`; consume rotate-ит current browser session, переносит этот
-timestamp и возвращает по bound `return_to`. Freshness истекает через 10 минут и не
-продлевается ordinary activity или sliding session TTL.
+После successful PostgreSQL active identity/account check одна atomic Valkey function
+валидирует flow/nonce, source token и active pointer, создаёт либо rotate-ит browser
+session, consume-ит token/pointer и удаляет flow. Все credential mutations имеют одну
+linearization point; distributed PostgreSQL transaction нет. Два concurrent POST одной
+form создают ровно одну session, а проигравший terminal invalid и не revoke-ит успешную
+session.
 
 ## Следующий вопрос
 
-Считаем ли explicit private-chat action «Подтвердить вход», непосредственно выпускающий
-`web_session` link, достаточной fresh bot authentication без дополнительного PIN,
-пароля или второй confirmation-кнопки?
+Должен ли общий `/auth` rate-limit reject быть retryable `429 Too Many Requests` с
+`Retry-After`, сохранять flow/token/cookie/nonce и никогда не redirect-ить на
+`result=invalid`?
 
-Рекомендация: да. Freshness создаёт только явная user-initiated command/callback в
-private one-to-one chat, bound к provider/user/chat/message/requester, которая сразу
-выпускает link; timestamp равен времени validated webhook event. Обычное недавнее
-сообщение, notification click, background event или existing browser session freshness
-не создают. Дополнительная кнопка после уже explicit action не доказывает новый factor
-и только усложняет flow; PIN/password/TOTP в принятой bot-first модели отсутствуют.
+Рекомендация: да. Один budget 10/min на normalized client IP охватывает initial GET,
+clean confirmation GET и POST; IP берётся только из trusted Caddy forwarding contract.
+Limiter срабатывает до credential lookup и не выполняет flow/token/session cleanup.
+Response использует `no-store`, `no-referrer`, generic body и `Retry-After`; отдельного
+per-flow/per-nonce budget, automatic retry и terminal marker нет.
