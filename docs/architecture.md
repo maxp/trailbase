@@ -536,9 +536,10 @@ TrailBase — открытый каталог GPX-треков с отображ
 - `new_session` outbox фиксирует internal target identity при projection. Later primary
   change не делает retarget/duplicate и не переписывает delivery; linked target получает
   её и после потери primary status. Unlink exact target до send terminally завершает
-  ordinary delivery без retry/retarget и encrypted detached-target snapshot. Этот
-  snapshot разрешён только для `identity_unlinked`; audit/web-inbox сохраняются, target
-  ID в метрике отсутствует.
+  ordinary delivery без retry/retarget и detached-target snapshot. Snapshot запрещён для
+  `new_session`; closed exception определён отдельно только для `identity_unlinked`.
+  Audit/web-inbox сохраняются, target ID в метрике
+  отсутствует.
 - Projector transaction фиксирует `delivery_locale` (`ru|en`, fallback `ru`) в
   `new_session` outbox; retry не перечитывает locale, а его смена влияет только на
   будущие messenger notifications. Web-inbox остаётся semantic и локализуется текущим
@@ -575,6 +576,112 @@ TrailBase — открытый каталог GPX-треков с отображ
   по notification type/schema/template version и блокирует removal; rewrite/drop/silent
   upgrade records ради gate запрещены. Delivered records, audit, semantic web-inbox и
   backup copies removal не блокируют.
+- `new_session` outbox сохраняет closed `manage_sessions` action code без absolute URL,
+  query, redirect target или action token. Catalog разрешает его в named internal route;
+  dispatcher строит same-origin canonical HTTPS URL из current `PUBLIC_BASE_URL`, а
+  startup проверяет HTTPS/allowlist. Смена base URL обновляет queued link, но не locale,
+  template version или semantic fields.
+- Generated `manage_sessions` link identifier-free: без user/session/notification/
+  outbox IDs и provider/locale/tracking query. Canonical route при отсутствии session
+  использует обычный auth flow с server-side allowlisted return target. Click-specific
+  analytics/audit нет; разрешены aggregate route/status HTTP metrics без user/outbox
+  labels, исключая leakage через provider/history/logs/referrer.
+- Если link открыт под другим authenticated TrailBase account, route показывает current
+  display name и только current account sessions. Navigation URL не bind-ит/switch-ит
+  account и не раскрывает expected recipient; смена требует explicit logout/re-auth.
+  Automatic switch/merge, target-account lookup и existence disclosure запрещены.
+- Sessions-management authenticated GET, htmx partial, mutation, validation/error и
+  redirect responses всегда ставят `Cache-Control: no-store` и
+  `Referrer-Policy: no-referrer`; Caddy/CDN их не кэшируют. History сохраняет только
+  identifier-free URL, не body. Cacheable summary и persistent client cache запрещены.
+- `occurred_at` хранится как UTC Instant. Messenger всегда показывает explicit `UTC`;
+  locale меняет format/wording, но не zone. Account timezone не хранится и не infer-ится
+  из IP/provider/language. Web локализует Instant browser `Intl`, показывает zone/offset
+  и UTC `datetime`, с explicit UTC fallback без client rendering.
+- Messenger показывает только absolute `occurred_at` до минут с explicit `UTC`, без
+  `recorded_at`, send/attempt time или relative age; retry/DLQ replay не меняют timestamp.
+  Web relative age допустим только secondary рядом с обязательным absolute local time,
+  вычисляется client-side и не хранится/outbox-ится.
+- Каждый distinct `new_session` claim даёт отдельные audit/inbox/delivery; batching по
+  minute/provider/device, fingerprint coalescing, replacement и collapsed inbox rows
+  запрещены. Dedupe только exact `event_id` + `session_digest` replay. UI показывает
+  count и отдельные occurred times; strict messenger order не вводится.
+- Flood сохраняет каждую audit/inbox/outbox row; suppression/digest/coalescing нет.
+  Dispatcher использует provider-wide budget, per-target pacing и fair target queues с
+  provider `Retry-After`. Local throttle оставляет row pending без attempt/DLQ; один
+  noisy account не блокирует других. Метрики queue depth/oldest age/throttled count
+  имеют только provider label, без target IDs.
+- `429 Retry-After` сохраняет в PostgreSQL provider-wide
+  `cooldown_until=max(current,parsed)`; triggering call расходует attempt, waiting rows —
+  нет. Все loops/restarts соблюдают cooldown, другой provider работает. Invalid/missing
+  header получает capped jittered fallback; ingress/projection/inbox не блокируются,
+  telemetry содержит только provider label.
+- Adapters используют closed errors `provider_blocked|target_unreachable|rate_limited|
+  transient|unclassified`. Global auth/config failure открывает durable provider circuit,
+  останавливает calls, оставляет rows pending без attempts и делает readiness failed;
+  другой provider работает. Target error terminal только для row; unclassified идёт в
+  DLQ/alert без circuit. Raw body/target ID/credentials не логируются и не DLQ-ятся.
+- `target_unreachable` оставляет identity linked/primary и не меняет future routing:
+  exact delivery terminal без retry/retarget, audit/inbox остаются, а future events
+  выбирают explicit current primary. Другой linked provider не получает fallback или
+  duplicate. Route меняют только user unlink/change-primary; automatic account mutation
+  запрещена.
+- `target_unreachable` durable ставит identity `delivery_health=unreachable` с observed
+  timestamp без raw reason; latest observed outcome под row lock побеждает stale race.
+  Web показывает generic warning и change-primary/unlink. Successful ordinary send
+  exact identity либо validated inbound user message от exact linked provider identity
+  ставит `reachable`; inbound использует application acceptance time, не provider
+  timestamp. Health не влияет на auth/linking/routing/queue.
+- `unreachable` не имеет TTL/manual dismiss; time, restart, circuit close и primary
+  change его не очищают. Recovery даёт только ordinary send success exact identity или
+  validated inbound user message exact linked identity; unlink удаляет state, relink
+  начинает с `unknown`. Non-primary warning остаётся только в identity card.
+- Inbound recovery принимает только validated user-authored private-chat message event
+  exact linked identity, включая commands, text и media. `callback_query`, inline query,
+  membership/service events и delivery receipts health не меняют.
+- Provider event dedupe выполняется до health mutation. Только первое accepted unique
+  message ставит `reachable`/application acceptance timestamp; exact replay получает
+  idempotent acknowledgement без DB update и не может перекрыть более свежий
+  `target_unreachable` новым observed timestamp.
+- Accepted inbound message exact linked identity обновляет health и для deactivated
+  account, поскольку reachability не является authorization. Это не reactivate-ит
+  account, не создаёт session/notification и не обходит command policy; retained health
+  используется после будущей reactivation.
+- Inbound recovery и unlink exact identity сериализуются identity row lock. Unlink-first
+  не позволяет event обновить/recreate/relink identity; inbound-first может поставить
+  `reachable`, после чего unlink удаляет row и health. Old provider identity не
+  attach-ится к future relink.
+- Concurrent inbound `reachable`/outbound `target_unreachable` используют application
+  observation time до ожидания lock: accepted-event time после dedupe и normalized
+  provider-result receipt соответственно. Под lock применяется только более новое;
+  commit/provider timestamps и send-start не участвуют, exact tie выигрывает
+  `unreachable`.
+- `delivery_health_observed_at` не показывается owner-у. Web/private-chat card имеет
+  actionable warning только для `unreachable`; `unknown|reachable` не получают badge/
+  timestamp. Поле остаётся internal ordering/operations data, не last activity или last
+  successful delivery.
+- Warning — derived UI projection, не messenger delivery/web-inbox/outbox/notification.
+  Web показывает его при owner view; private-chat settings — только через другую working
+  linked identity. Message ранее blocked exact bot сначала делает inbound recovery, и
+  его card уже без warning; без working identity bot warning невозможен, остаётся Web.
+- Closed warning copy: RU «Доставка в этот мессенджер недоступна. Разблокируйте бота,
+  если нужно, и отправьте ему сообщение.»; EN “Delivery to this messenger is
+  unavailable. Unblock the bot if needed, then send it a message.” Он общий для
+  Web/cross-identity card, без raw cause, рядом с change-primary/unlink.
+- `unreachable -> reachable` только убирает warning при следующем card render/read.
+  Recovery toast/flash/bot reply/notification/inbox/outbox/audit отсутствуют; normal
+  response исходной message не объявляет channel recovery.
+- Открытая Web card не refresh-ится автоматически после inbound recovery: polling,
+  SSE/WebSocket отсутствуют. Она может быть stale до navigation/обычного htmx card
+  refresh; следующий server render читает authoritative row. Bot card обновляется при
+  следующем user request; `Cache-Control: no-store` сохраняется.
+- `user_identities` хранит `delivery_health text NOT NULL DEFAULT 'unknown'` с CHECK
+  `unknown|reachable|unreachable` и nullable `delivery_health_observed_at timestamptz`;
+  compound CHECK связывает unknown/NULL и observed/non-NULL. Enum, raw reason, manual
+  clear и отдельная health-history table отсутствуют.
+- Отдельной delivery-check функции нет: Web/private-chat action, probe routes,
+  `delivery_kind=health_probe`, outbox/status/polling/cooldown и test-message templates
+  отсутствуют.
 - Timeout/network error после dispatch этой mutating function — ambiguous commit, не
   mutation-free `503`. Handler делает bounded retry/read-back по opaque commit ID;
   success или сохраняющий flow `503` допустим только при подтверждённом результате, а
