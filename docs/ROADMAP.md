@@ -293,6 +293,12 @@ explicit identity linking, roles и active-session management.
   очищается у browser через `Max-Age=0`; valid record при wrong/stale nonce и current
   cookie сохраняются. Используется общий `/auth` rate limit 10/min на IP без отдельного
   nonce-attempt counter.
+- `/auth` rate-limit reject — retryable `429` с `Retry-After`, не terminal invalid.
+  Один budget 10/min на normalized client IP из trusted Caddy forwarding охватывает
+  initial token GET, clean confirmation GET и POST. Limiter работает до credential
+  lookup, сохраняет flow/token/cookie/nonce/session и отвечает generic `no-store`/
+  `no-referrer` body без redirect, automatic retry, terminal marker или отдельных
+  per-flow/per-nonce budgets.
 - Non-transient invalid `POST /auth` использует PRG: `303` на token-free `/auth` со
   stable query marker `result=invalid`, затем generic-invalid GET без lookup current
   flow. Cleanup зависит от уже принятого error class, поэтому wrong/stale nonce для
@@ -300,11 +306,95 @@ explicit identity linking, roles и active-session management.
   retryable `503` с `Retry-After` без redirect, terminal marker или credential
   mutations и сохраняет retryable flow/token/cookie.
 - После successful PostgreSQL active identity/account check одна atomic Valkey function
-  валидирует flow/nonce, source token и active pointer, создаёт либо rotate-ит browser
-  session, consume-ит token/pointer и удаляет flow. Все credential mutations имеют одну
-  linearization point; distributed PostgreSQL transaction нет. Два concurrent POST
-  одной form создают ровно одну session, а проигравший terminal invalid и не revoke-ит
-  успешную session.
+  валидирует flow/nonce, source token и active pointer, promote-ит flow-ID digest в
+  session namespace, создаёт либо rotate-ит browser session, consume-ит token/pointer и
+  заменяет flow completion receipt как одну credential linearization point; distributed
+  PostgreSQL transaction нет.
+- Receipt до original flow deadline хранит nonce hash, allowlisted `return_to`, session
+  digest/status и expiry без raw ID. Success/matching retry ставит session cookie в тот
+  же raw flow-ID value и очищает flow cookie. Concurrent/repeated POST возвращает
+  identical success по flow digest, не создаёт вторую и не revoke-ит committed session;
+  прежний terminal-invalid concurrent-loser outcome отменён.
+- Commit создаёт provisional session и receipt с `PEXPIREAT` original flow deadline.
+  Первый request с новой session cookie после PostgreSQL account validation атомарно
+  помечает session claimed, удаляет receipt и включает one-year sliding TTL. Без cookie
+  оба provisional keys истекают без orphan/janitor; expiry claimed session не revoke-ит,
+  а validation `503` сохраняет provisional state до deadline.
+- Provisional session скрыта из active-session list и создаёт только low-card auth
+  metric. Ordinary-login claim ровно один раз создаёт audit, web-inbox record и
+  locked-on primary-bot `new_session` outbox intent, idempotently keyed session digest.
+  Same-browser re-auth notification не создаёт; delivery failure не rollback-ит claimed
+  session и retry-ится независимо.
+- Та же atomic claim function одной Valkey operation делает `XADD` durable
+  `session_claimed` event в Stream session Valkey. Event содержит random UUID,
+  `user_id`, provider, safe device summary, claim time и internal session digest только
+  для idempotency, без raw token, IP и cookie. Worker одной PostgreSQL transaction
+  idempotently создаёт audit/web-inbox/outbox с UNIQUE guards по session digest и event
+  ID и делает `XACK` только после commit; pending/retry не создают duplicates, delivery
+  остаётся независимой outbox-задачей.
+- Для `session_claimed` общий terminal DLQ не применяется: transient и deterministic
+  failures с operational alert retry-ятся бессрочно с capped backoff/jitter, а unacked
+  entry остаётся в PEL и не trim/ack/drop-ится. После PostgreSQL commit worker делает
+  `XACK`, затем `XDEL`; cleanup acknowledged остатка можно повторить. Метрики содержат
+  только pending count, oldest age и retry count без event/session/user identifiers.
+- `session_claimed` использует dedicated Stream и consumer group в session Valkey,
+  отдельно от webhook ordering/retention/retry/DLQ. Существующий worker process
+  запускает отдельный consumer loop без нового service/container; readiness и
+  low-cardinality lag/PEL metrics проверяются отдельно, а общий shutdown lifecycle и
+  `XAUTOCLAIM` после 60 секунд обеспечивают failover.
+- Projector lag/unhealthy readiness не блокирует новые claims, пока atomic claim +
+  `XADD` commit-ятся. Web не ждёт/не poll-ит worker и не ставит PEL age/size gate;
+  задержка видна в worker readiness/alerts. Невозможность commit-ить claim + event не
+  даёт success и использует ambiguous-outcome recovery без обхода `XADD`.
+- Recipient snapshot/target identity в event отсутствуют. Projector под
+  user/identity lock order выбирает current primary и одной PostgreSQL transaction
+  создаёт audit/web-inbox/locked-on outbox. Порядок commit с primary change определяет
+  old/new target; recipient PII/stale snapshot в Valkey не хранится, а deactivated
+  account использует обязательную security-notification policy.
+- Server-generated UTC `claimed_at` из event сохраняется как immutable `occurred_at`,
+  PostgreSQL transaction time — отдельно как `recorded_at`. Inbox/message показывает
+  время факта; audit/inbox сортируются по `occurred_at`, затем event ID. `recorded_at`
+  служит только projection-lag diagnostics и не подменяет login time.
+- Event обязан содержать integer `schema_version = 1` и полный payload strict closed
+  Malli schema. Missing/unsupported version или malformed field до DB mutations
+  остаётся pending, alert-ит и делает group unready без default/coercion, `XACK` или
+  DLQ. Breaking rollout временно поддерживает переходные versions только до drain
+  старого PEL, без постоянного compatibility layer.
+- Safe device summary — immutable closed map `browser_family|os_family|device_class`
+  из maintained server-side UA parser. Catalogs ограничены browser
+  `chrome|safari|firefox|edge|webview|other|unknown`, OS
+  `android|ios|windows|macos|linux|other|unknown`, class
+  `mobile|tablet|desktop|other|unknown`; parse failure даёт `unknown`. Session/event/
+  audit/notification используют одну map; raw UA, versions, model, language и IP не
+  сохраняются и не логируются.
+- `auth_provider = telegram|max` означает immutable source consumed token из validated
+  binding, а не request/current primary. Audit/inbox/message показывают этот
+  локализованный source; outbox target независимо выбирает current primary. Provider
+  user/identity ID отсутствует, unlink/primary change historical fact не меняют.
+- Append-only auth audit row — единый PostgreSQL idempotency root с independent UNIQUE
+  по `event_id` и `session_digest`; связанные inbox/outbox создаются после неё той же
+  transaction. Exact matching replay переиспользует rows. One-guard или payload
+  mismatch rollback-ит transaction как integrity incident, оставляет event pending и
+  alert-ит без `XACK`; partial independently-deduped projection запрещена.
+- `event_id` — application-generated UUIDv7, созданный до first dispatch и сохранённый
+  first claim в session claim state/`XADD` для stable retry/read-back. Он является audit
+  root primary/idempotency key и FK target inbox/outbox. Stream ID используется только
+  transport bookkeeping PEL/`XACK`/`XDEL`, не сохраняется как domain ID; replacement
+  DB ID и UUIDv4 отсутствуют.
+- Failed/pending event не создаёт global/per-user head-of-line block: bounded pool fair
+  schedule-ит новые и due-retry entries, не допуская двух in-flight owners одного
+  Stream ID. Failure остаётся в PEL/backoff, alert-ит и держит group unready, но later
+  valid events продолжаются. Same-user races сериализует DB user lock; audit/inbox
+  order — `occurred_at,event_id`, strict messenger delivery order отсутствует.
+- Revoke/logout/expiry до projection/send не подавляют immutable login audit,
+  web-inbox или pending `new_session` delivery; projector/dispatcher не перечитывают
+  current session. Message показывает occurred time, auth provider, safe device и
+  generic «Управление сессиями», без direct target или заявления об active state.
+- Timeout/network error после dispatch этой mutating function — ambiguous commit, не
+  mutation-free `503`. Handler делает bounded retry/read-back по opaque commit ID;
+  success или сохраняющий flow `503` допустим только при подтверждённом результате, а
+  прежний `503` — только до dispatch либо при proven non-commit. Для still-unknown
+  outcome требуется recoverable branch без terminal cleanup и blind second session.
 - Browser re-auth переиспользует тот же bot-issued `web_session` token и `/auth`
   GET/POST без отдельного credential/table/cookie/consume endpoint. Token выдаётся
   только после fresh bot authentication и хранит её `fresh_authenticated_at`; новая
@@ -388,12 +478,12 @@ explicit identity linking, roles и active-session management.
 - Если `/auth` видит valid current browser session того же user, rotation является
   credential refresh: новые token/CSRF/freshness заменяют current session, остальные
   sessions не меняются, `new_session` web-inbox/bot notification не создаётся. Без
-  valid same-user current session successful `/auth` остаётся ordinary new login и
-  использует locked-on security notification.
+  valid same-user current session commit создаёт provisional ordinary new login, а
+  locked-on security notification появляется только при claim.
 - Same-browser rotated session сохраняет original `created_at`, обновляет token hash,
   CSRF, bot-derived `fresh_authenticated_at`, current `last_seen_at` и safe short
-  User-Agent summary; one-year sliding TTL начинается заново. Отдельного
-  `reauthenticated_at` нет. Ordinary new login получает новый `created_at`.
+  User-Agent summary; one-year sliding TTL начинается после provisional claim.
+  Отдельного `reauthenticated_at` нет. Ordinary new login получает новый `created_at`.
 
 **Acceptance**:
 - Первый валидированный Telegram `/start` в private one-to-one chat для неизвестной
@@ -536,7 +626,8 @@ explicit identity linking, roles и active-session management.
 - Session cookie проверяется middleware; запрос на web UI без cookie предлагает вход
   через Telegram/Max.
 - Logout текущей сессии, logout-all и active sessions management работают в web UI и
-  private chat; sessions имеют sliding TTL один год.
+  private chat; claimed sessions имеют sliding TTL один год, provisional session —
+  exact auth-flow deadline до первого validated request.
 - Session list в chat не раскрывает IP или identifiers и позволяет выбрать конкретную
   session по безопасному summary через opaque bound control.
 - Одна session не revoke-ится первым нажатием: confirmation требуется, fresh auth —
@@ -1655,16 +1746,128 @@ private draft → moderated immutable revision.
   token/pointer/session mutations. Unknown cookie очищается у browser `Max-Age=0`, но
   wrong/stale nonce для valid record сохраняет record и current cookie. Общий `/auth`
   rate limit — 10/min на IP; отдельного nonce-attempt counter нет.
+- `/auth` rate-limit reject — retryable `429` с `Retry-After`, не terminal invalid.
+  Один budget 10/min на normalized trusted-proxy client IP охватывает initial token
+  GET, clean confirmation GET и POST. До credential lookup limiter сохраняет весь
+  credential state и отвечает generic `no-store`/`no-referrer` body без redirect,
+  automatic retry или отдельного per-flow/per-nonce budget.
 - Non-transient invalid `POST /auth` отвечает `303` на token-free `/auth` со stable
   `result=invalid`; target GET generic-invalid и не lookup-ит current flow. Cleanup
   следует принятому error class, поэтому wrong/stale nonce сохраняет valid flow/cookie.
   Transient PostgreSQL/Valkey failure остаётся retryable `503` с `Retry-After` без
   redirect, terminal marker и credential mutations, сохраняя flow/token/cookie.
 - После successful PostgreSQL identity/account check одна atomic Valkey function
-  валидирует flow/nonce, source token и active pointer, создаёт либо rotate-ит session,
-  consume-ит token/pointer и удаляет flow как одну credential linearization point.
-  Distributed PostgreSQL transaction нет; два concurrent POST создают ровно одну
-  session, проигравший terminal invalid и успешную session не revoke-ит.
+  валидирует flow/nonce, source token и active pointer, promote-ит flow-ID digest в
+  session namespace, создаёт либо rotate-ит session, consume-ит token/pointer и
+  заменяет flow receipt как одну credential linearization point; distributed
+  PostgreSQL transaction нет.
+- Receipt до original deadline хранит nonce hash, `return_to`, session digest/status и
+  expiry без raw ID. Success/retry ставит session cookie в raw flow-ID value и очищает
+  flow cookie; duplicate POST даёт identical success без второй/revoked session. Это
+  заменяет прежний terminal-invalid concurrent-loser outcome.
+- Commit создаёт provisional session/receipt с `PEXPIREAT` original deadline. Первый
+  validated request с session cookie атомарно claim-ит session, удаляет receipt и
+  включает one-year sliding TTL. Если cookie не доставлена, оба keys истекают без
+  orphan/janitor; claimed session receipt expiry не revoke-ит.
+- Provisional session скрыта из active-session list и даёт только low-card auth metric.
+  Ordinary-login claim ровно один раз создаёт audit/web-inbox/locked-on primary-bot
+  outbox, idempotently keyed session digest. Same-browser re-auth notification нет;
+  delivery failure не rollback-ит claim и retry-ится независимо.
+- Та же atomic claim function делает `XADD` durable `session_claimed` event в Stream
+  session Valkey с random UUID, `user_id`, provider, safe device summary, claim time и
+  internal session digest, без raw token, IP и cookie. Worker одной PostgreSQL
+  transaction idempotently создаёт audit/web-inbox/outbox с UNIQUE guards по session
+  digest и event ID и делает `XACK` только после commit; pending/retry не дублируют
+  записи, delivery остаётся независимой outbox-задачей.
+- `session_claimed` не использует terminal DLQ: transient/deterministic failures
+  бессрочно retry-ятся с capped backoff/jitter и alert, оставаясь в PEL без trim,
+  ack или drop. После PostgreSQL commit следуют `XACK` и `XDEL`; cleanup acknowledged
+  остатка повторяем. Метрики low-card: pending count, oldest age и retry count без IDs.
+- Для него выделены отдельные Stream и consumer group в session Valkey. Existing worker
+  process запускает отдельный loop без нового deployment unit; webhook policy не
+  переиспользуется, readiness/lag/PEL проверяются отдельно, failover использует общий
+  60-second `XAUTOCLAIM` lifecycle.
+- Projector lag не блокирует claim после successful atomic claim + `XADD`: synchronous
+  wait/poll и PEL age/size gate отсутствуют, worker readiness/alerts показывают delay.
+  Failure commit этой Valkey operation не может вернуть success и идёт в принятую
+  ambiguous-outcome recovery.
+- Recipient target в event не snapshot-ится: projector под existing user/identity
+  locks выбирает current primary и transactionally создаёт audit/web-inbox/outbox.
+  Primary-change race определяется commit order; Valkey не хранит recipient PII, а
+  deactivated-account security exception сохраняется.
+- Server UTC `claimed_at` становится immutable `occurred_at`, а PostgreSQL transaction
+  time — отдельным `recorded_at`. UI показывает occurred time; audit/inbox order —
+  `occurred_at`, event ID. Recorded time нужен только для projection-lag diagnostics.
+- Exact integer `schema_version = 1` и strict closed Malli payload обязательны.
+  Missing/unsupported/malformed event остаётся в PEL, alert-ит и делает group unready
+  без mutation/default/coercion/ack/DLQ; переходная multi-version support живёт только
+  до drain старого PEL.
+- Safe device summary — одна immutable closed map browser/OS/device-class из maintained
+  parser с bounded catalogs и `unknown` fallback. Raw UA, exact versions, model,
+  language и IP не сохраняются; parse failure claim не блокирует.
+- `auth_provider=telegram|max` берётся только из consumed-token binding и остаётся
+  historical auth source; current primary определяет лишь delivery target. External
+  provider identity ID отсутствует, unlink/primary change source не переписывают.
+- Одна append-only audit row с independent UNIQUE `event_id`/`session_digest` является
+  idempotency root для связанных inbox/outbox. Exact replay успешен; guard/payload
+  mismatch rollback-ится, alert-ит и остаётся pending без `XACK`, partial projection
+  невозможна.
+- `event_id` — generated-before-dispatch UUIDv7, сохранённый в claim state/`XADD` и
+  переиспользуемый retry/read-back как audit root/FK key. Stream ID — только PEL/
+  `XACK`/`XDEL` transport offset, не domain ID; DB replacement/UUIDv4 нет.
+- Failed event остаётся PEL/backoff/unready, но bounded fair worker без global/per-user
+  HOL продолжает later valid events; один Stream ID имеет один in-flight owner.
+  Same-user DB lock защищает races, order отображается по occurred time/event ID без
+  strict messenger delivery guarantee.
+- Session revoke/logout/expiry не отменяет historical audit/inbox/pending delivery.
+  Dispatcher не re-read-ит session; message показывает occurred time/source/safe device
+  и generic session-management action без active-state claim или direct revoke target.
+- `new_session` outbox фиксирует internal target identity при projection. Later primary
+  change не делает retarget/duplicate и не переписывает delivery; linked target получает
+  её и после потери primary status. Unlink exact target до send terminally завершает
+  ordinary delivery без retry/retarget и encrypted detached-target snapshot. Этот
+  snapshot разрешён только для `identity_unlinked`; audit/web-inbox сохраняются, target
+  ID в метрике отсутствует.
+- Projector transaction фиксирует `delivery_locale` (`ru|en`, fallback `ru`) в
+  `new_session` outbox; retry не перечитывает locale, а его смена влияет только на
+  будущие messenger notifications. Web-inbox остаётся semantic и локализуется текущим
+  UI locale. Outbox содержит notification type, schema/template version и allowlisted
+  semantic fields без rendered text или user-supplied free form.
+- Dispatcher рендерит exact записанный `template_version`. Immutable bundled templates
+  имеют обязательные `ru`/`en`, проверяемые при startup, и сохраняются минимум 90 дней
+  после последнего producer deployment версии. Missing version не вызывает Bot API:
+  это deterministic failure с обычным alert/DLQ и replay после возврата шаблона, без
+  silent fallback на current version.
+- Template catalog key — notification type, `template_version` и locale, без provider.
+  Telegram/Max получают одинаковые wording, semantic fields и meaning; adapters меняют
+  только escaping, markup, equivalent controls и transport limits. Если кнопка
+  недоступна, тот же safe HTTPS URL включается в text без другого editorial template.
+- Каждый security template с maximum allowlisted values в `ru`/`en` обязан помещаться
+  в одно сообщение обоих providers: одна outbox delivery — один atomic send, без split,
+  truncation или удаления fields. CI/startup проверяют worst case по более строгому
+  Telegram/Max limit; invalid catalog останавливает dispatcher consumer и его readiness,
+  а превышение требует новой короткой template version.
+- Notification type + `schema_version` задают strict closed Malli payload schema;
+  каждая `template_version` совместима ровно с одной schema version. Projector до
+  insert валидирует required fields/types/no extras; failure rollback-ит transaction,
+  оставляет `session_claimed` в PEL и alert-ит. Dispatcher повторно валидирует stored
+  payload; mismatch не render-ится и не вызывает Bot API, а идёт в deterministic
+  alert/DLQ. Coercion/defaults/ignored unknown fields отсутствуют.
+- Notification schema/template pair включается двухрелизным expand/activate rollout:
+  первый release добавляет её в catalog/dispatcher без смены producer, второй successful
+  release переключает producer constant, когда previous rollback image уже знает обе
+  versions. Старые versions сохраняются минимум 90 дней. Runtime registry, dual-write
+  и silent downgrade отсутствуют; contract test проверяет emitted pair в current и
+  rollback catalogs.
+- Retire старой schema/template pair разрешён только после 90 дней с last emission и
+  при zero replayable undelivered/DLQ references. Deploy preflight группирует references
+  по notification type/schema/template version и блокирует removal; rewrite/drop/silent
+  upgrade records ради gate запрещены. Delivered records, audit, semantic web-inbox и
+  backup copies removal не блокируют.
+- Post-dispatch timeout/network error — ambiguous commit, не mutation-free `503`.
+  Bounded retry/read-back по opaque commit ID должен подтвердить success/non-commit;
+  только pre-dispatch или proven non-commit получает сохраняющий flow `503`.
+  Still-unknown outcome идёт в recoverable branch без cleanup или blind second session.
 - Freshness для appeal link создаёт только bound explicit private-chat
   «Подтвердить вход», сразу выпускающий token; recent messages, notifications,
   background events и browser activity не считаются fresh auth. Второго prompt/PIN нет.
@@ -1673,11 +1876,11 @@ private draft → moderated immutable revision.
   success freshness применяется к account независимо от provider.
 - Same-browser re-auth с valid same-user current session не создаёт ложный
   `new_session` notification: current credential/CSRF заменяются, other sessions
-  неизменны. Без такой session `/auth` остаётся настоящим new login с обычным locked-on
-  security notification.
+  неизменны. Без такой session commit создаёт provisional ordinary login, а обычное
+  locked-on security notification появляется только при claim.
 - Rotated same-browser record сохраняет original `created_at`, обновляет
-  credential/CSRF/freshness/last-seen/safe-UA и сбрасывает sliding TTL на один год;
-  отдельного `reauthenticated_at` нет.
+  credential/CSRF/freshness/last-seen/safe-UA; sliding TTL на один год начинается после
+  provisional claim, отдельного `reauthenticated_at` нет.
 - Server-rendered form содержит один 128-bit base64url `idempotency_key` для обеих
   buttons. Committed outcome сохраняет только UNIQUE SHA-256 hash без raw key или
   отдельной idempotency table/TTL. Same hash и exact normalized removal/outcome/reason

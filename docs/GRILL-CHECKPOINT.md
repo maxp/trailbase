@@ -1,7 +1,7 @@
 # TrailBase — Grill-me Checkpoint
 
 Статус: paused
-Дата: 2026-08-01
+Дата: 2026-08-02
 
 Принятые решения сохранены в
 [Implementation Contract](IMPLEMENTATION-CONTRACT.md). Этот файл хранит только точку
@@ -9,21 +9,21 @@
 
 ## Последнее подтверждённое решение
 
-После successful PostgreSQL active identity/account check одна atomic Valkey function
-валидирует flow/nonce, source token и active pointer, создаёт либо rotate-ит browser
-session, consume-ит token/pointer и удаляет flow. Все credential mutations имеют одну
-linearization point; distributed PostgreSQL transaction нет. Два concurrent POST одной
-form создают ровно одну session, а проигравший terminal invalid и не revoke-ит успешную
-session.
+Удаление старой schema/template pair требует одновременно минимум 90 дней с последней
+emission и ноль ссылок из replayable undelivered/DLQ records. Deploy preflight
+группирует их по notification type, `schema_version` и `template_version` и блокирует
+removal при ненулевом count. Records нельзя rewrite, drop или silently переводить на
+новую version ради gate. Delivered records, audit, semantic web-inbox и backup copies
+removal не блокируют.
 
 ## Следующий вопрос
 
-Должен ли общий `/auth` rate-limit reject быть retryable `429 Too Many Requests` с
-`Retry-After`, сохранять flow/token/cookie/nonce и никогда не redirect-ить на
-`result=invalid`?
+Должен ли `new_session` outbox хранить только закрытый action code `manage_sessions`, а
+dispatcher строить актуальный canonical HTTPS URL из `PUBLIC_BASE_URL` при send?
 
-Рекомендация: да. Один budget 10/min на normalized client IP охватывает initial GET,
-clean confirmation GET и POST; IP берётся только из trusted Caddy forwarding contract.
-Limiter срабатывает до credential lookup и не выполняет flow/token/session cleanup.
-Response использует `no-store`, `no-referrer`, generic body и `Retry-After`; отдельного
-per-flow/per-nonce budget, automatic retry и terminal marker нет.
+Рекомендация: да. Absolute URL, query и redirect target в payload не сохраняются.
+Catalog связывает `manage_sessions` с named internal route управления сессиями, а
+adapter при send строит same-origin URL из текущего `PUBLIC_BASE_URL`; startup validation
+проверяет HTTPS, allowlisted route и отсутствие action token. Смена public base URL
+намеренно влияет на queued delivery, чтобы ссылка оставалась рабочей, но не меняет
+зафиксированные locale, template version или semantic event fields.
