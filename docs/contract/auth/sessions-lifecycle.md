@@ -13,8 +13,9 @@
   Valkey key строится из `SHA-256(token)`.
 - Cookie: `__Host-trailbase_session`, `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`,
   без `Domain`.
-- Session хранит `user_id`, `created_at`, `last_seen_at`, `fresh_authenticated_at`,
-  сокращённый `User-Agent` и CSRF state. `fresh_authenticated_at` не меняется от
+- Session хранит `user_id`, `created_at`, `last_seen_at`, nullable
+  `fresh_authenticated_at`, сокращённый `User-Agent` и CSRF state. NULL означает, что
+  session ещё не проходила fresh authentication. `fresh_authenticated_at` не меняется от
   обычных requests, `last_seen_at` или sliding TTL; sensitive web operation допускает
   его только до absolute `fresh_authenticated_at + 10 minutes`. IP в session/profile
   не сохраняется. `reauthenticated_at` отсутствует: при credential rotation original

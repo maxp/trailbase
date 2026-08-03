@@ -9,6 +9,7 @@ area. Read only the topics touched by a change, plus their linked ADRs.
 - [Permissions](security-permissions.md), [webhooks](bots.md),
   [delivery health](bots/delivery-and-provider-health.md) and
   [observability](observability.md)
+- [Telegram и MAX Mini Apps](miniapps.md)
 - [GPX intake and storage](tracks/ingest-storage.md), [track revisions](tracks/revisions-exports.md)
   and [public exports](tracks/public-exports.md)
 - [Moderation and appeals](moderation-appeals.md), [classification](classification.md),

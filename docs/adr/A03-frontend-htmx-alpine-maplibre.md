@@ -7,6 +7,12 @@
 кластеризует уже агрегированные features повторно. Полный frontend/map contract:
 [Implementation Contract](../contract/poi-map.md).
 
+**Уточнение 2026-08-03:** тот же frontend обязательно работает как Telegram Mini App
+и MAX Mini App. Общие screens и domain behavior не fork-аются; различия bridge API,
+темы, viewport, native controls и link handling локализованы в двух provider adapters.
+Валидированный launch создаёт обычную, но не fresh-authenticated browser session.
+Нормативные правила: [Mini Apps Telegram и MAX](../contract/miniapps.md).
+
 ## Контекст
 
 Слои фронтенда TrailBase: (а) auth-зона (server-side session cookie — см. A01); (б) поиск по фасетам + instant-search (см. A05); (в) каталог-списки и детали треков; (г) карта с basemap + адаптивными треками и кластерами POI (см. A02); (д) формы загрузки треков; (е) профиль высоты / галерея фото; (ж) модерация-инбокс.
@@ -22,7 +28,10 @@
 3. **MapLibre GL JS** — JS-остров. Персистентный DOM-узел вне htmx-swap-области; WebGL-рендер.
    - **POI clustering**: PostGIS возвращает готовые hex-grid cluster features; GeoJSON source использует `cluster: false`.
    - **Track polylines**: WebGL-рендер адаптивных GeoJSON, data-driven стиль (цвет по activity/difficulty).
-4. **Bridge glue** (~100 строк): события карты → alpine store → htmx/ajax; htmx-события (hover трек в списке) → `map.setFeatureState`. Контейнер карты помечен `hx-disable` (htmx не свапает вглубь).
+4. **Map bridge glue** (~100 строк): события карты → alpine store → htmx/ajax; htmx-события (hover трек в списке) → `map.setFeatureState`. Контейнер карты помечен `hx-disable` (htmx не свапает вглубь).
+5. **Mini App adapters** — отдельные тонкие adapters для официальных Telegram и MAX
+   bridge API поверх общего mobile-first UI. Они адаптируют provider theme, viewport,
+   safe area, native controls и link handling, но не содержат domain behavior.
 
 ## Альтернативы рассмотренные (фронтенд-фреймворк)
 
@@ -31,7 +40,7 @@
 
 ## Альтернативы рассмотренные (map-библиотека)
 
-- **Leaflet.** DOM/Canvas; markercluster держит 10k–50k POI, но лаг沿线 на 2000–3000 LineString при pan/zoom. Подходит для POI, но спотыкается о ключевую задачу — плотный слой треков.
+- **Leaflet.** DOM/Canvas; markercluster держит 10k–50k POI, но тормозит на 2000–3000 LineString при pan/zoom. Подходит для POI, но спотыкается о ключевую задачу — плотный слой треков.
 - **OpenLayers.** Canvas/WebGL; возможно лучший по perf для LineString (MDPI 2025). Отвергнут из-за verbose API и steep learning curve для SPA-bridge — избыточен при htmx-доминанте.
 - **Deck.gl.** WebGL; overkill (миллионы точек, 3D), требует подложки MapLibre/Leaflet-bottom.
 - **Protomaps.** Требует PMTiles-формат basemap — противоречит требованию готовых OSM-тайлов.
@@ -39,4 +48,4 @@
 ## Последствия
 
 - Положительные: маленький bundle, быстрая first-paint, server-rendered partials совпадают с cookie-auth (A01); один map-API для POI clusters и polylines; WebGL cap убирает DOM-краш.
-- Отрицательные: два пути данных (HTML partial + raw GeoJSON) — каждый scoped interaction (hover в списке → highlight на карте, fly-to из search) — явный bridge-код; при росте числа interactions линейно растёт cost glue; при каком-то пороге окупается переход к SPA (без слома backend — REST API готов).
+- Отрицательные: два пути данных (HTML partial + raw GeoJSON) — каждый scoped interaction (hover в списке → highlight на карте, fly-to из search) — явный bridge-код; два messenger adapters требуют compatibility tests по версиям Telegram/MAX; при росте числа interactions линейно растёт cost glue; при каком-то пороге окупается переход к SPA (без слома backend — REST API готов).

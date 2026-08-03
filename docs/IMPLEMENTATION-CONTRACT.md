@@ -15,6 +15,7 @@
   - [Browser auth flow и delivery-health defaults](contract/auth/browser-flow.md)
 - [Valkey sessions и account lifecycle](contract/auth/sessions-lifecycle.md)
 - [Permissions и HTTP security](contract/security-permissions.md)
+- [Mini Apps Telegram и MAX](contract/miniapps.md)
 - [Webhooks, bot workers и notifications](contract/bots.md)
   - [Notification delivery и provider health](contract/bots/delivery-and-provider-health.md)
 - [Health, logs и metrics](contract/observability.md)

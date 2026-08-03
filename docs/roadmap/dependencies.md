@@ -7,3 +7,7 @@ dependency says otherwise.
 Cross-cutting requirements — security, logging, schemas, migrations and tests — live
 in the relevant contract topic. Every milestone must demonstrate its end-to-end
 acceptance path; a horizontal layer alone is not a completed slice.
+
+After M02 provides the Telegram and MAX Mini App launch/session adapters, every
+milestone that adds authenticated web UI verifies its main user path in the ordinary
+browser and both Mini Apps unless its acceptance explicitly limits the surface.

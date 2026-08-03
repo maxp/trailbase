@@ -46,6 +46,8 @@
 - Browser API same-origin; CORS не включается до появления отдельного клиента.
 - CSP включена с M01: CSP-compatible Alpine build, local JS/CSS, без inline scripts и
   `unsafe-eval`; MapLibre получает точечные `worker-src blob:` и tile-provider origins.
+  Только Mini App entry routes дополнительно разрешают официальные Telegram/MAX SDK
+  origins из закрытого allowlist; этот доступ не распространяется на остальные routes.
 - Production отправляет HSTS `max-age=31536000; includeSubDomains`, без `preload`.
   Dev HSTS не отправляет.
 - Rate limits через Valkey:
@@ -59,4 +61,3 @@
 - GPX download limiter применяется до publication lookup и S3 signing и считает все
   попытки, включая будущий `404`. Browser session лимит не повышает. Последующий S3
   GET по presigned URL этим limiter не учитывается.
-
