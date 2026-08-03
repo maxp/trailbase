@@ -8,9 +8,6 @@
 2. `docs/ROADMAP.md` — границы, зависимости и acceptance criteria срезов.
 3. `docs/adr/` — мотивация архитектурных решений.
 
-`docs/GRILL-CHECKPOINT.md` хранит незавершённый вопрос. Рекомендация из него не
-является принятым решением, пока пользователь явно её не подтвердил.
-
 Не разрешай противоречия и пробелы в продуктовых решениях молча. Укажи точное место
 неопределённости и запроси решение, если от него существенно зависит реализация.
 
@@ -26,8 +23,7 @@
 ## Безопасность
 
 - Не коммить и не логируй secrets, raw auth/session tokens и чувствительные payloads.
-- Для изменения поведения добавляй или обновляй проверку, воспроизводящую это
-  поведение.
+- Для изменения поведения добавляй или обновляй проверку, воспроизводящую это поведение.
 
 ## Завершение задачи
 
@@ -38,3 +34,11 @@
   проверки и причину.
 - Коммить и пушь только по явному запросу. Добавляй в коммит только файлы задачи и
   после push проверяй upstream и чистоту рабочего дерева.
+
+## Engineering Principles
+
+- Do not preserve backward compatibility unless explicitly required.
+- Choose the simplest implementation that fully meets the current requirements.
+- Prefer established, well-maintained libraries over custom implementations.
+- Fix root causes, not symptoms.
+- Recommend best practices, even when they require refactoring.

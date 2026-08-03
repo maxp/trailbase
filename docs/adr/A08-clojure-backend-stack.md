@@ -5,11 +5,16 @@
 
 **Уточнение 2026-07-28:** runtime — Java 25, Ring adapter — `http-kit`, handlers
 синхронные, async work вынесен в Valkey-backed workers. Полный runtime contract:
-[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#1-runtime-и-границы-сервисов).
+[Implementation Contract](../contract/runtime.md).
 
 **Уточнение 2026-07-29:** Telegram/Max chats вызывают общие upload/search domain
 services напрямую; deep-link token нужен только для optional browser session.
 Короткоживущий chat-search callback state хранится в Valkey за случайным opaque ID.
+
+**Уточнение 2026-08-01:** runtime требует Valkey 9.x minimum. Fresh-auth delivery
+использует hash-field absolute expiry `HPEXPIREAT` и idempotent `HDEL`, сохраняя
+seven-day dedupe marker и short-lived raw delivery field в одной record без janitor или
+второго TTL key.
 
 ## Контекст
 

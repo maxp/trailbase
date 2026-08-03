@@ -5,7 +5,7 @@
 
 **Уточнение 2026-07-28:** canonical geometry — 2D MultiLineString в immutable track
 revision; точная zoom-матрица и tolerances зафиксированы в
-[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#17-map-delivery-и-browser-state).
+[Implementation Contract](../contract/poi-map.md).
 
 **Уточнение 2026-07-30:** один GPX attachment создаёт один draft, включая файл с
 несколькими `<trk>`. Каждый валидный `<trkseg>` остаётся отдельным компонентом

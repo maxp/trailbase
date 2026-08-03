@@ -6,7 +6,7 @@
 **Уточнение 2026-07-28:** locations и track content versioned; POI links являются
 отдельно модерируемыми revision annotations с multiple occurrences. Geometry kind
 отделён от semantic category. Полный контракт:
-[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#16-poigazetteer).
+[Implementation Contract](../contract/poi-map.md).
 
 ## Контекст
 

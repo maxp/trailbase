@@ -5,7 +5,7 @@
 
 **Уточнение 2026-07-28:** POI clustering выполняется только server-side; MapLibre не
 кластеризует уже агрегированные features повторно. Полный frontend/map contract:
-[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#17-map-delivery-и-browser-state).
+[Implementation Contract](../contract/poi-map.md).
 
 ## Контекст
 

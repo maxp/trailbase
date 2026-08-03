@@ -5,7 +5,7 @@
 
 **Уточнение 2026-07-28:** HTML и JSON имеют явные endpoints, pagination keyset,
 все facet counts считаются server-side с disjunctive semantics. Полный контракт:
-[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#18-search-contract).
+[Implementation Contract](../contract/search.md).
 
 ## Контекст
 

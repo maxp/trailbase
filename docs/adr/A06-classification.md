@@ -7,7 +7,7 @@
 четыре bits без отдельного year-round bit; difficulty и duration допускают unknown.
 Canonical duration выбирается moving → elapsed → unknown; manual override ограничен
 целыми секундами `1..31_536_000`, а unknown хранится как `NULL`. Полный контракт:
-[Implementation Contract](../IMPLEMENTATION-CONTRACT.md#15-classification-и-tags).
+[Implementation Contract](../contract/classification.md).
 
 **Уточнение 2026-07-30:** activity, difficulty и tags остаются в TrailBase
 track page/JSON API и не сериализуются в sanitized GPX `<trk><type>` или
